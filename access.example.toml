@@ -1,0 +1,27 @@
+[access]
+token = "change-access-token"
+server_url = "ws://127.0.0.1:8443/tunnel"
+
+[[listeners]]
+name = "mysql"
+mode = "tcp"
+listen = "127.0.0.1:3308"
+host = "10.0.0.10"
+port = 3306
+
+[[listeners]]
+name = "redis"
+mode = "tcp"
+listen = "127.0.0.1:63790"
+host = "10.0.0.11"
+port = 6379
+
+[[listeners]]
+name = "admin"
+mode = "http"
+listen = "127.0.0.1:18080"
+scheme = "https"
+host = "admin.internal.local"
+port = 443
+rewrite_location = true
+rewrite_cookie = true
