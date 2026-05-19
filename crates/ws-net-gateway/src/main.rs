@@ -17,8 +17,9 @@ use tokio::{
 };
 use tracing::{info, warn};
 use ws_net_common::{
-    decode_data_frame_owned, decode_message, encode_data_frame, encode_message, DataFramePayload,
-    GatewayConfig, HttpRequestPayload, HttpResponsePayload, Message, Mode, TargetConfig,
+    decode_data_frame_owned, decode_message, encode_message, new_data_frame_buffer,
+    DataFramePayload, GatewayConfig, HttpRequestPayload, HttpResponsePayload, Message, Mode,
+    TargetConfig,
 };
 
 const TCP_BUFFER_SIZE: usize = 128 * 1024;
@@ -275,16 +276,15 @@ async fn handle_tcp_stream_result(
     send_text(outbound, &Message::OpenOk { stream_id }).await?;
 
     let (mut tcp_read, mut tcp_write) = socket.into_split();
-    let mut tcp_buf = vec![0_u8; TCP_BUFFER_SIZE];
 
     loop {
         tokio::select! {
-            read = tcp_read.read(&mut tcp_buf) => {
-                let n = read?;
-                if n == 0 {
+            read = read_data_frame(&mut tcp_read, stream_id) => {
+                let frame = read?;
+                let Some(frame) = frame else {
                     break;
-                }
-                outbound.send(axum::extract::ws::Message::Binary(encode_data_frame(stream_id, &tcp_buf[..n]))).await?;
+                };
+                outbound.send(axum::extract::ws::Message::Binary(frame)).await?;
             }
             Some(bytes) = write_rx.recv() => {
                 tcp_write.write_all(bytes.as_slice()).await?;
@@ -294,6 +294,20 @@ async fn handle_tcp_stream_result(
     }
 
     Ok(())
+}
+
+async fn read_data_frame<R>(reader: &mut R, stream_id: u64) -> Result<Option<Vec<u8>>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut frame = new_data_frame_buffer(stream_id, TCP_BUFFER_SIZE);
+    let n = reader.read(&mut frame[8..]).await?;
+    if n == 0 {
+        return Ok(None);
+    }
+
+    frame.truncate(8 + n);
+    Ok(Some(frame))
 }
 
 async fn handle_http_request(

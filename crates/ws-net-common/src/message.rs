@@ -101,6 +101,12 @@ pub fn encode_data_frame(stream_id: StreamId, bytes: &[u8]) -> Vec<u8> {
     frame
 }
 
+pub fn new_data_frame_buffer(stream_id: StreamId, payload_capacity: usize) -> Vec<u8> {
+    let mut frame = vec![0_u8; 8 + payload_capacity];
+    frame[..8].copy_from_slice(&stream_id.to_be_bytes());
+    frame
+}
+
 pub fn decode_data_frame(frame: &[u8]) -> Option<(StreamId, Vec<u8>)> {
     if frame.len() < 8 {
         return None;

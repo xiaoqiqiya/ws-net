@@ -37,7 +37,7 @@ use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use tracing::{error, info, warn};
 use ws_net_common::{
-    decode_data_frame_owned, decode_message, encode_data_frame, encode_message, AccessConfig,
+    decode_data_frame_owned, decode_message, encode_message, new_data_frame_buffer, AccessConfig,
     DataFramePayload, HttpRequestPayload, HttpResponsePayload, ListenerConfig, Message, Mode,
     StreamId,
 };
@@ -448,17 +448,16 @@ async fn handle_tcp_connection(
     connection.tcp_streams.insert(stream_id, write_tx);
 
     let (mut local_read, mut local_write) = socket.into_split();
-    let mut local_buf = vec![0_u8; TCP_BUFFER_SIZE];
 
     loop {
         tokio::select! {
-            read = local_read.read(&mut local_buf) => {
-                let n = read?;
-                if n == 0 {
+            read = read_data_frame(&mut local_read, stream_id) => {
+                let frame = read?;
+                let Some(frame) = frame else {
                     send_text(&connection, &Message::Close { stream_id, reason: "local_closed".to_string() }).await?;
                     break;
-                }
-                send_binary(&connection, stream_id, &local_buf[..n]).await?;
+                };
+                send_binary(&connection, frame).await?;
             }
             Some(bytes) = write_rx.recv() => {
                 local_write.write_all(bytes.as_slice()).await?;
@@ -469,6 +468,20 @@ async fn handle_tcp_connection(
 
     connection.tcp_streams.remove(&stream_id);
     Ok(())
+}
+
+async fn read_data_frame<R>(reader: &mut R, stream_id: StreamId) -> Result<Option<Vec<u8>>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut frame = new_data_frame_buffer(stream_id, TCP_BUFFER_SIZE);
+    let n = reader.read(&mut frame[8..]).await?;
+    if n == 0 {
+        return Ok(None);
+    }
+
+    frame.truncate(8 + n);
+    Ok(Some(frame))
 }
 
 async fn run_http_listener(state: AppState, listener: ListenerConfig) -> Result<()> {
@@ -694,16 +707,9 @@ async fn send_text(connection: &GatewayConnection, message: &Message) -> Result<
     Ok(())
 }
 
-async fn send_binary(
-    connection: &GatewayConnection,
-    stream_id: StreamId,
-    bytes: &[u8],
-) -> Result<()> {
+async fn send_binary(connection: &GatewayConnection, frame: Vec<u8>) -> Result<()> {
     ensure_gateway_open(connection)?;
-    connection
-        .outbound
-        .send(WsMessage::Binary(encode_data_frame(stream_id, bytes)))
-        .await?;
+    connection.outbound.send(WsMessage::Binary(frame)).await?;
     Ok(())
 }
 
