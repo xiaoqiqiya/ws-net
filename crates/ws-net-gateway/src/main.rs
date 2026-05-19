@@ -21,6 +21,9 @@ use ws_net_common::{
     HttpRequestPayload, HttpResponsePayload, Message, Mode, TargetConfig,
 };
 
+const TCP_BUFFER_SIZE: usize = 128 * 1024;
+const TCP_STREAM_CHANNEL_CAPACITY: usize = 512;
+
 #[derive(Debug, Parser)]
 struct Args {
     #[arg(short, long, default_value = "gateway.toml")]
@@ -264,14 +267,15 @@ async fn handle_tcp_stream_result(
     let socket = TcpStream::connect(&addr)
         .await
         .with_context(|| format!("connect target {addr}"))?;
+    socket.set_nodelay(true)?;
     info!(stream_id, target = %target_name, addr = %addr, "tcp target connected");
 
-    let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(256);
+    let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(TCP_STREAM_CHANNEL_CAPACITY);
     streams.insert(stream_id, write_tx);
     send_text(outbound, &Message::OpenOk { stream_id }).await?;
 
     let (mut tcp_read, mut tcp_write) = socket.into_split();
-    let mut tcp_buf = vec![0_u8; 16 * 1024];
+    let mut tcp_buf = vec![0_u8; TCP_BUFFER_SIZE];
 
     loop {
         tokio::select! {

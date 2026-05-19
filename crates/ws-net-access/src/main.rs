@@ -41,6 +41,9 @@ use ws_net_common::{
     HttpRequestPayload, HttpResponsePayload, ListenerConfig, Message, Mode, StreamId,
 };
 
+const TCP_BUFFER_SIZE: usize = 128 * 1024;
+const TCP_STREAM_CHANNEL_CAPACITY: usize = 512;
+
 #[derive(Debug, Parser)]
 struct Args {
     #[arg(short, long, default_value = "access.toml")]
@@ -372,6 +375,8 @@ async fn handle_tcp_connection(
     listener: ListenerConfig,
     socket: TcpStream,
 ) -> Result<()> {
+    socket.set_nodelay(true)?;
+
     let connection = state
         .connections
         .for_listener(&listener, state.default_server_url.as_deref())?;
@@ -401,11 +406,11 @@ async fn handle_tcp_connection(
         Err(err) => return Err(anyhow!("gateway error {err}")),
     }
 
-    let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(256);
+    let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(TCP_STREAM_CHANNEL_CAPACITY);
     connection.tcp_streams.insert(stream_id, write_tx);
 
     let (mut local_read, mut local_write) = socket.into_split();
-    let mut local_buf = vec![0_u8; 16 * 1024];
+    let mut local_buf = vec![0_u8; TCP_BUFFER_SIZE];
 
     loop {
         tokio::select! {
