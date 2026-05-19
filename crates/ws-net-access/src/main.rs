@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     net::SocketAddr,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     time::Duration,
@@ -37,12 +37,13 @@ use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use tracing::{error, info, warn};
 use ws_net_common::{
-    decode_data_frame, decode_message, encode_data_frame, encode_message, AccessConfig,
-    HttpRequestPayload, HttpResponsePayload, ListenerConfig, Message, Mode, StreamId,
+    decode_data_frame_owned, decode_message, encode_data_frame, encode_message, AccessConfig,
+    DataFramePayload, HttpRequestPayload, HttpResponsePayload, ListenerConfig, Message, Mode,
+    StreamId,
 };
 
 const TCP_BUFFER_SIZE: usize = 128 * 1024;
-const TCP_STREAM_CHANNEL_CAPACITY: usize = 512;
+const TCP_STREAM_CHANNEL_CAPACITY: usize = 64;
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -67,22 +68,28 @@ struct GatewayConnection {
     outbound: mpsc::Sender<WsMessage>,
     closed: AtomicBool,
     stream_ids: AtomicU64,
-    tcp_streams: DashMap<StreamId, mpsc::Sender<Vec<u8>>>,
+    tcp_streams: DashMap<StreamId, mpsc::Sender<DataFramePayload>>,
     open_waiters: DashMap<StreamId, oneshot::Sender<Result<(), String>>>,
     http_waiters: DashMap<StreamId, oneshot::Sender<Result<HttpResponsePayload, String>>>,
 }
 
 struct GatewayConnections {
+    pools: Vec<GatewayConnectionPool>,
+}
+
+struct GatewayConnectionPool {
+    server_url: String,
     connections: Vec<Arc<GatewayConnection>>,
+    next: AtomicUsize,
 }
 
 impl GatewayConnections {
-    fn new(connections: Vec<Arc<GatewayConnection>>) -> Result<Self> {
-        if connections.is_empty() {
-            return Err(anyhow!("no gateway connections available"));
+    fn new(pools: Vec<GatewayConnectionPool>) -> Result<Self> {
+        if pools.is_empty() {
+            return Err(anyhow!("no gateway connection pools available"));
         }
 
-        Ok(Self { connections })
+        Ok(Self { pools })
     }
 
     fn for_listener(
@@ -97,12 +104,12 @@ impl GatewayConnections {
             .filter(|server_url| !server_url.is_empty())
             .or(default_server_url);
 
-        match (server_url, self.connections.as_slice()) {
+        match (server_url, self.pools.as_slice()) {
             (Some(server_url), _) => self
-                .connections
+                .pools
                 .iter()
-                .find(|connection| connection.server_url == server_url)
-                .cloned()
+                .find(|pool| pool.server_url == server_url)
+                .map(GatewayConnectionPool::next_connection)
                 .ok_or_else(|| {
                     anyhow!(
                         "listener '{}' references unavailable gateway '{}'",
@@ -110,9 +117,36 @@ impl GatewayConnections {
                         server_url
                     )
                 }),
-            (None, [connection]) => Ok(connection.clone()),
+            (None, [pool]) => Ok(pool.next_connection()),
             (None, _) => Err(anyhow!("listener '{}' must set server_url", listener.name)),
         }
+    }
+}
+
+impl GatewayConnectionPool {
+    fn new(server_url: String, connections: Vec<Arc<GatewayConnection>>) -> Result<Self> {
+        if connections.is_empty() {
+            return Err(anyhow!("gateway pool '{server_url}' has no connections"));
+        }
+
+        Ok(Self {
+            server_url,
+            connections,
+            next: AtomicUsize::new(0),
+        })
+    }
+
+    fn next_connection(&self) -> Arc<GatewayConnection> {
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
+
+        for offset in 0..self.connections.len() {
+            let connection = &self.connections[(start + offset) % self.connections.len()];
+            if !connection.closed.load(Ordering::Acquire) && !connection.outbound.is_closed() {
+                return connection.clone();
+            }
+        }
+
+        self.connections[start % self.connections.len()].clone()
     }
 }
 
@@ -175,13 +209,17 @@ fn install_rustls_crypto_provider() {
 }
 
 async fn connect_all_registered(config: &AccessConfig) -> Result<Arc<GatewayConnections>> {
-    let connections = config
-        .server_urls()
-        .into_iter()
-        .map(|server_url| start_gateway_connection(config, server_url))
-        .collect::<Vec<_>>();
+    let mut pools = Vec::new();
+    let pool_size = config.access.gateway_pool_size.max(1);
 
-    Ok(Arc::new(GatewayConnections::new(connections)?))
+    for server_url in config.server_urls() {
+        let connections = (0..pool_size)
+            .map(|_| start_gateway_connection(config, server_url.clone()))
+            .collect::<Vec<_>>();
+        pools.push(GatewayConnectionPool::new(server_url, connections)?);
+    }
+
+    Ok(Arc::new(GatewayConnections::new(pools)?))
 }
 
 fn start_gateway_connection(config: &AccessConfig, server_url: String) -> Arc<GatewayConnection> {
@@ -292,7 +330,7 @@ async fn handle_gateway_frame(connection: &GatewayConnection, frame: WsMessage) 
             Err(err) => warn!(error = %err, "failed to decode gateway text message"),
         },
         WsMessage::Binary(bytes) => {
-            if let Some((stream_id, payload)) = decode_data_frame(&bytes) {
+            if let Some((stream_id, payload)) = decode_data_frame_owned(bytes) {
                 if let Some(tx) = connection
                     .tcp_streams
                     .get(&stream_id)
@@ -406,7 +444,7 @@ async fn handle_tcp_connection(
         Err(err) => return Err(anyhow!("gateway error {err}")),
     }
 
-    let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(TCP_STREAM_CHANNEL_CAPACITY);
+    let (write_tx, mut write_rx) = mpsc::channel::<DataFramePayload>(TCP_STREAM_CHANNEL_CAPACITY);
     connection.tcp_streams.insert(stream_id, write_tx);
 
     let (mut local_read, mut local_write) = socket.into_split();
@@ -423,7 +461,7 @@ async fn handle_tcp_connection(
                 send_binary(&connection, stream_id, &local_buf[..n]).await?;
             }
             Some(bytes) = write_rx.recv() => {
-                local_write.write_all(&bytes).await?;
+                local_write.write_all(bytes.as_slice()).await?;
             }
             else => break,
         }

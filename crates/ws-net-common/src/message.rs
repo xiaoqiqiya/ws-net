@@ -4,6 +4,18 @@ use crate::TargetConfig;
 
 pub type StreamId = u64;
 
+#[derive(Debug)]
+pub struct DataFramePayload {
+    frame: Vec<u8>,
+    payload_offset: usize,
+}
+
+impl DataFramePayload {
+    pub fn as_slice(&self) -> &[u8] {
+        &self.frame[self.payload_offset..]
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
@@ -97,4 +109,21 @@ pub fn decode_data_frame(frame: &[u8]) -> Option<(StreamId, Vec<u8>)> {
     let mut id = [0_u8; 8];
     id.copy_from_slice(&frame[..8]);
     Some((StreamId::from_be_bytes(id), frame[8..].to_vec()))
+}
+
+pub fn decode_data_frame_owned(frame: Vec<u8>) -> Option<(StreamId, DataFramePayload)> {
+    if frame.len() < 8 {
+        return None;
+    }
+
+    let mut id = [0_u8; 8];
+    id.copy_from_slice(&frame[..8]);
+
+    Some((
+        StreamId::from_be_bytes(id),
+        DataFramePayload {
+            frame,
+            payload_offset: 8,
+        },
+    ))
 }

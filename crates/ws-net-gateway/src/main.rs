@@ -17,12 +17,12 @@ use tokio::{
 };
 use tracing::{info, warn};
 use ws_net_common::{
-    decode_data_frame, decode_message, encode_data_frame, encode_message, GatewayConfig,
-    HttpRequestPayload, HttpResponsePayload, Message, Mode, TargetConfig,
+    decode_data_frame_owned, decode_message, encode_data_frame, encode_message, DataFramePayload,
+    GatewayConfig, HttpRequestPayload, HttpResponsePayload, Message, Mode, TargetConfig,
 };
 
 const TCP_BUFFER_SIZE: usize = 128 * 1024;
-const TCP_STREAM_CHANNEL_CAPACITY: usize = 512;
+const TCP_STREAM_CHANNEL_CAPACITY: usize = 64;
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -38,7 +38,7 @@ struct AppState {
 }
 
 type Outbound = mpsc::Sender<axum::extract::ws::Message>;
-type TcpStreams = Arc<DashMap<u64, mpsc::Sender<Vec<u8>>>>;
+type TcpStreams = Arc<DashMap<u64, mpsc::Sender<DataFramePayload>>>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -129,7 +129,7 @@ async fn handle_socket_result(socket: axum::extract::ws::WebSocket, state: AppSt
                 handle_text_message(&state, &outbound, &streams, &text).await?;
             }
             axum::extract::ws::Message::Binary(bytes) => {
-                if let Some((stream_id, payload)) = decode_data_frame(&bytes) {
+                if let Some((stream_id, payload)) = decode_data_frame_owned(bytes) {
                     if let Some(tx) = streams.get(&stream_id).map(|entry| entry.value().clone()) {
                         let _ = tx.send(payload).await;
                     }
@@ -270,7 +270,7 @@ async fn handle_tcp_stream_result(
     socket.set_nodelay(true)?;
     info!(stream_id, target = %target_name, addr = %addr, "tcp target connected");
 
-    let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(TCP_STREAM_CHANNEL_CAPACITY);
+    let (write_tx, mut write_rx) = mpsc::channel::<DataFramePayload>(TCP_STREAM_CHANNEL_CAPACITY);
     streams.insert(stream_id, write_tx);
     send_text(outbound, &Message::OpenOk { stream_id }).await?;
 
@@ -287,7 +287,7 @@ async fn handle_tcp_stream_result(
                 outbound.send(axum::extract::ws::Message::Binary(encode_data_frame(stream_id, &tcp_buf[..n]))).await?;
             }
             Some(bytes) = write_rx.recv() => {
-                tcp_write.write_all(&bytes).await?;
+                tcp_write.write_all(bytes.as_slice()).await?;
             }
             else => break,
         }

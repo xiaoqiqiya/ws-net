@@ -51,6 +51,8 @@ pub struct AccessSection {
     pub server_url: Option<String>,
     #[serde(default)]
     pub server_urls: Vec<String>,
+    #[serde(default = "default_gateway_pool_size")]
+    pub gateway_pool_size: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -141,4 +143,8 @@ impl AccessConfig {
 
 fn default_tunnel_path() -> String {
     "/tunnel".to_string()
+}
+
+fn default_gateway_pool_size() -> usize {
+    8
 }

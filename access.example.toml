@@ -1,6 +1,8 @@
 [access]
 token = "change-access-token"
 server_url = "ws://127.0.0.1:8443/tunnel"
+# Number of WebSocket tunnels opened to each gateway. Increase for many concurrent SSH/TCP streams.
+gateway_pool_size = 8
 
 [[listeners]]
 name = "mysql"
