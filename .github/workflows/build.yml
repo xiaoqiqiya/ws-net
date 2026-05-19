@@ -1,3 +1,5 @@
+# Author: zhangqi
+
 name: build
 
 on:
@@ -6,6 +8,11 @@ on:
   push:
     branches:
       - main
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -30,9 +37,20 @@ jobs:
           cp access.example.toml dist/
         shell: bash
 
+      - name: Package dist
+        run: tar -czf ws-net-linux-${GITHUB_REF_NAME}.tar.gz -C dist .
+        shell: bash
+
       - name: Upload dist artifact
         uses: actions/upload-artifact@v4
         with:
           name: ws-net-linux
-          path: dist/
+          path: ws-net-linux-${{ github.ref_name }}.tar.gz
           if-no-files-found: error
+
+      - name: Upload dist to GitHub Releases
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ws-net-linux-${{ github.ref_name }}.tar.gz
+          generate_release_notes: true
