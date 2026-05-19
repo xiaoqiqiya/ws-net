@@ -10,6 +10,7 @@ clap.workspace = true
 dashmap.workspace = true
 futures-util.workspace = true
 reqwest.workspace = true
+rustls.workspace = true
 serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true

@@ -1,0 +1,346 @@
+[access]
+token = "change-access-token"
+
+[[listeners]]
+name = "mysql-9707"
+mode = "tcp"
+server_url = "wss://yqaic.eastobacco.com:1443/ws"
+listen = "127.0.0.1:9707"
+host = "10.63.248.130"
+port = 22
+
+[[listeners]]
+name = "mysql-9708"
+mode = "tcp"
+server_url = "wss://yqaic.eastobacco.com:1443/ws"
+listen = "127.0.0.1:9708"
+host = "10.63.248.131"
+port = 22
+
+[[listeners]]
+name = "mysql-9709"
+mode = "tcp"
+server_url = "wss://yqaic.eastobacco.com:1443/ws"
+listen = "127.0.0.1:9709"
+host = "10.63.248.132"
+port = 22
+
+[[listeners]]
+name = "mysql-9710"
+mode = "tcp"
+server_url = "wss://yqaic.eastobacco.com:1443/ws"
+listen = "127.0.0.1:9710"
+host = "10.63.248.133"
+port = 22
+
+[[listeners]]
+name = "mysql-9711"
+mode = "tcp"
+server_url = "wss://yqaic.eastobacco.com:1443/ws"
+listen = "127.0.0.1:9711"
+host = "10.63.248.134"
+port = 22
+
+[[listeners]]
+name = "mysql-9712"
+mode = "tcp"
+server_url = "wss://yqaic.eastobacco.com:1443/ws"
+listen = "127.0.0.1:9712"
+host = "10.63.248.135"
+port = 22
+
+[[listeners]]
+name = "mysql-9713"
+mode = "tcp"
+server_url = "wss://yqaic.eastobacco.com:1443/ws"
+listen = "127.0.0.1:9713"
+host = "10.63.248.136"
+port = 22
+
+[[listeners]]
+name = "mysql-9714"
+mode = "tcp"
+server_url = "wss://yqaic.eastobacco.com:1443/ws"
+listen = "127.0.0.1:9714"
+host = "10.63.248.137"
+port = 22
+
+[[listeners]]
+name = "mysql-9716"
+mode = "tcp"
+server_url = "wss://yqaic.eastobacco.com:1443/ws"
+listen = "127.0.0.1:9716"
+host = "10.63.248.138"
+port = 22
+
+[[listeners]]
+name = "mysql-9717"
+mode = "tcp"
+server_url = "wss://yqaic.eastobacco.com:1443/ws"
+listen = "127.0.0.1:9717"
+host = "10.63.248.139"
+port = 22
+
+[[listeners]]
+name = "mysql-9718"
+mode = "tcp"
+server_url = "wss://yqaic.eastobacco.com:1443/ws"
+listen = "127.0.0.1:9718"
+host = "10.63.248.148"
+port = 22
+
+[[listeners]]
+name = "mysql-9719"
+mode = "tcp"
+server_url = "wss://yqaic.eastobacco.com:1443/ws"
+listen = "127.0.0.1:9719"
+host = "10.63.248.147"
+port = 22
+
+[[listeners]]
+name = "mysql-9720"
+mode = "tcp"
+server_url = "wss://yqaic.eastobacco.com:1443/ws"
+listen = "127.0.0.1:9720"
+host = "10.63.248.144"
+port = 22
+
+[[listeners]]
+name = "mysql-9721"
+mode = "tcp"
+server_url = "wss://yqaic.eastobacco.com:1443/ws"
+listen = "127.0.0.1:9721"
+host = "10.63.248.142"
+port = 22
+
+[[listeners]]
+name = "mysql-7155"
+mode = "tcp"
+server_url = "wss://yqaic.eastobacco.com:1443/ws"
+listen = "127.0.0.1:7155"
+host = "10.63.248.155"
+port = 22
+
+[[listeners]]
+name = "mysql-90"
+mode = "tcp"
+server_url = "wss://yqaic.eastobacco.com:1443/ws"
+listen = "127.0.0.1:90"
+host = "10.63.248.148"
+port = 90
+
+[[listeners]]
+name = "mysql-80"
+mode = "tcp"
+server_url = "wss://yqaic.eastobacco.com:1443/ws"
+listen = "127.0.0.1:80"
+host = "10.63.248.148"
+port = 80
+
+[[listeners]]
+name = "mysql-8848"
+mode = "tcp"
+server_url = "wss://yqaic.eastobacco.com:1443/ws"
+listen = "127.0.0.1:8848"
+host = "10.63.248.148"
+port = 8848
+
+[[listeners]]
+name = "xxl-job-18096"
+mode = "tcp"
+server_url = "wss://yqaic.eastobacco.com:1443/ws"
+listen = "127.0.0.1:18096"
+host = "10.63.248.148"
+port = 18096
+
+[[listeners]]
+name = "kafka-ui-5111"
+mode = "tcp"
+server_url = "wss://yqaic.eastobacco.com:1443/ws"
+listen = "127.0.0.1:5111"
+host = "10.63.248.148"
+port = 5111
+
+[[listeners]]
+name = "service-13386"
+mode = "tcp"
+server_url = "wss://yqaic.eastobacco.com:1443/ws"
+listen = "127.0.0.1:13386"
+host = "10.63.248.155"
+port = 13386
+
+[[listeners]]
+name = "cloudbeaver-18978"
+mode = "tcp"
+server_url = "wss://yqaic.eastobacco.com:1443/ws"
+listen = "127.0.0.1:18978"
+host = "10.63.248.148"
+port = 8978
+
+[[listeners]]
+name = "nacos-18848"
+mode = "tcp"
+server_url = "wss://yqaic.eastobacco.com:1443/ws"
+listen = "127.0.0.1:18848"
+host = "10.63.248.144"
+port = 8848
+
+[[listeners]]
+name = "nacos-5236"
+mode = "tcp"
+server_url = "wss://yqaic.eastobacco.com:1443/ws"
+listen = "127.0.0.1:5236"
+host = "10.63.248.213"
+port = 5236
+
+[[listeners]]
+name = "xxl-job-18080"
+mode = "tcp"
+server_url = "wss://yqaic.eastobacco.com:1443/ws"
+listen = "127.0.0.1:18080"
+host = "10.63.248.148"
+port = 18080
+
+[[listeners]]
+name = "xxl-job-18099"
+mode = "tcp"
+server_url = "wss://yqaic.eastobacco.com:1443/ws"
+listen = "127.0.0.1:18099"
+host = "10.63.248.148"
+port = 18099
+
+[[listeners]]
+name = "rocketmq-console-18181"
+mode = "tcp"
+server_url = "wss://yqaic.eastobacco.com:1443/ws"
+listen = "127.0.0.1:18181"
+host = "10.63.248.142"
+port = 8181
+
+[[listeners]]
+name = "rocketmq-console-5601"
+mode = "tcp"
+server_url = "wss://yqaic.eastobacco.com:1443/ws"
+listen = "127.0.0.1:5601"
+host = "10.63.248.148"
+port = 5601
+
+[[listeners]]
+name = "rocketmq-console-5264"
+mode = "tcp"
+server_url = "wss://yqaic.eastobacco.com:1443/ws"
+listen = "127.0.0.1:5264"
+host = "10.63.248.148"
+port = 5264
+
+[[listeners]]
+name = "clickhouse-8123"
+mode = "tcp"
+server_url = "wss://yqaic.eastobacco.com:1443/ws"
+listen = "127.0.0.1:8123"
+host = "10.63.248.148"
+port = 8123
+
+[[listeners]]
+name = "clickhouse-16379"
+mode = "tcp"
+server_url = "wss://yqaic.eastobacco.com:1443/ws"
+listen = "127.0.0.1:16379"
+host = "10.63.248.148"
+port = 16379
+
+[[listeners]]
+name = "redis-7617"
+mode = "tcp"
+server_url = "wss://yqaic.eastobacco.com:1443/ws"
+listen = "127.0.0.1:7617"
+host = "10.63.248.144"
+port = 7617
+
+[[listeners]]
+name = "redis-85"
+mode = "tcp"
+server_url = "wss://yqaic.eastobacco.com:1443/ws"
+listen = "127.0.0.1:85"
+host = "10.63.248.169"
+port = 85
+
+[[listeners]]
+name = "service-9060"
+mode = "tcp"
+server_url = "wss://yqaic.eastobacco.com:1443/ws"
+listen = "127.0.0.1:9060"
+host = "10.63.248.137"
+port = 9060
+
+[[listeners]]
+name = "service-19060"
+mode = "tcp"
+server_url = "wss://yqaic.eastobacco.com:1443/ws"
+listen = "127.0.0.1:19060"
+host = "10.63.248.134"
+port = 9060
+
+[[listeners]]
+name = "ssh-8713"
+mode = "tcp"
+server_url = "wss://yqai.eastobacco.com:2443/ws"
+listen = "127.0.0.1:8713"
+host = "10.62.4.110"
+port = 22
+
+[[listeners]]
+name = "ssh-8714"
+mode = "tcp"
+server_url = "wss://yqai.eastobacco.com:2443/ws"
+listen = "127.0.0.1:8714"
+host = "10.62.4.111"
+port = 22
+
+[[listeners]]
+name = "ssh-8715"
+mode = "tcp"
+server_url = "wss://yqai.eastobacco.com:2443/ws"
+listen = "127.0.0.1:8715"
+host = "10.62.4.112"
+port = 22
+
+[[listeners]]
+name = "ssh-8716"
+mode = "tcp"
+server_url = "wss://yqai.eastobacco.com:2443/ws"
+listen = "127.0.0.1:8716"
+host = "10.62.4.113"
+port = 22
+
+[[listeners]]
+name = "ssh-8717"
+mode = "tcp"
+server_url = "wss://yqai.eastobacco.com:2443/ws"
+listen = "127.0.0.1:8717"
+host = "10.62.4.115"
+port = 22
+
+[[listeners]]
+name = "ssh-8718"
+mode = "tcp"
+server_url = "wss://yqai.eastobacco.com:2443/ws"
+listen = "127.0.0.1:8718"
+host = "10.62.4.116"
+port = 22
+
+[[listeners]]
+name = "service-8719"
+mode = "tcp"
+server_url = "wss://yqai.eastobacco.com:2443/ws"
+listen = "127.0.0.1:8719"
+host = "10.62.4.113"
+port = 9999
+
+[[listeners]]
+name = "service-9900"
+mode = "tcp"
+server_url = "wss://yqai.eastobacco.com:443/in/ws"
+listen = "127.0.0.1:9900"
+host = "10.63.248.148"
+port = 90

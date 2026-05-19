@@ -2,9 +2,10 @@ use std::{
     collections::HashSet,
     net::SocketAddr,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
+    time::Duration,
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -19,11 +20,20 @@ use axum::{
 use clap::Parser;
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo},
+    server::conn::auto::Builder as HyperBuilder,
+    service::TowerToHyperService,
+};
+use rcgen::{CertificateParams, DistinguishedName, DnType, SanType};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::{mpsc, oneshot},
+    time::sleep,
 };
+use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use tracing::{error, info, warn};
 use ws_net_common::{
@@ -39,7 +49,8 @@ struct Args {
 
 #[derive(Clone)]
 struct AppState {
-    connection: Arc<GatewayConnection>,
+    default_server_url: Option<String>,
+    connections: Arc<GatewayConnections>,
 }
 
 #[derive(Clone)]
@@ -49,21 +60,88 @@ struct HttpListenerState {
 }
 
 struct GatewayConnection {
+    server_url: String,
     outbound: mpsc::Sender<WsMessage>,
+    closed: AtomicBool,
     stream_ids: AtomicU64,
     tcp_streams: DashMap<StreamId, mpsc::Sender<Vec<u8>>>,
     open_waiters: DashMap<StreamId, oneshot::Sender<Result<(), String>>>,
     http_waiters: DashMap<StreamId, oneshot::Sender<Result<HttpResponsePayload, String>>>,
 }
 
+struct GatewayConnections {
+    connections: Vec<Arc<GatewayConnection>>,
+}
+
+impl GatewayConnections {
+    fn new(connections: Vec<Arc<GatewayConnection>>) -> Result<Self> {
+        if connections.is_empty() {
+            return Err(anyhow!("no gateway connections available"));
+        }
+
+        Ok(Self { connections })
+    }
+
+    fn for_listener(
+        &self,
+        listener: &ListenerConfig,
+        default_server_url: Option<&str>,
+    ) -> Result<Arc<GatewayConnection>> {
+        let server_url = listener
+            .server_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|server_url| !server_url.is_empty())
+            .or(default_server_url);
+
+        match (server_url, self.connections.as_slice()) {
+            (Some(server_url), _) => self
+                .connections
+                .iter()
+                .find(|connection| connection.server_url == server_url)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "listener '{}' references unavailable gateway '{}'",
+                        listener.name,
+                        server_url
+                    )
+                }),
+            (None, [connection]) => Ok(connection.clone()),
+            (None, _) => Err(anyhow!("listener '{}' must set server_url", listener.name)),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    install_rustls_crypto_provider();
     tracing_subscriber::fmt().with_env_filter("info").init();
 
     let args = Args::parse();
     let config = Arc::new(AccessConfig::load(&args.config).context("load access config")?);
-    let connection = connect_registered(&config).await?;
-    let state = AppState { connection };
+    let connections = connect_all_registered(&config).await?;
+    let default_server_url = config
+        .access
+        .server_url
+        .as_deref()
+        .map(str::trim)
+        .and_then(|url| {
+            if url.is_empty() {
+                None
+            } else {
+                Some(url.to_string())
+            }
+        });
+    for listener in &config.listeners {
+        connections
+            .for_listener(listener, default_server_url.as_deref())
+            .with_context(|| format!("validate listener '{}' gateway", listener.name))?;
+    }
+    let state = AppState {
+        default_server_url,
+        connections,
+    };
 
     for listener in config.listeners.clone() {
         let state = state.clone();
@@ -89,13 +167,79 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn connect_registered(config: &AccessConfig) -> Result<Arc<GatewayConnection>> {
-    let (ws, _) = connect_async(config.access.server_url.as_str()).await?;
+fn install_rustls_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+async fn connect_all_registered(config: &AccessConfig) -> Result<Arc<GatewayConnections>> {
+    let connections = config
+        .server_urls()
+        .into_iter()
+        .map(|server_url| start_gateway_connection(config, server_url))
+        .collect::<Vec<_>>();
+
+    Ok(Arc::new(GatewayConnections::new(connections)?))
+}
+
+fn start_gateway_connection(config: &AccessConfig, server_url: String) -> Arc<GatewayConnection> {
+    let (outbound, outbound_rx) = mpsc::channel::<WsMessage>(1024);
+    let connection = Arc::new(GatewayConnection {
+        server_url,
+        outbound,
+        closed: AtomicBool::new(true),
+        stream_ids: AtomicU64::new(1),
+        tcp_streams: DashMap::new(),
+        open_waiters: DashMap::new(),
+        http_waiters: DashMap::new(),
+    });
+
+    tokio::spawn(run_gateway_connection(
+        connection.clone(),
+        config.access.token.clone(),
+        outbound_rx,
+    ));
+
+    connection
+}
+
+async fn run_gateway_connection(
+    connection: Arc<GatewayConnection>,
+    token: String,
+    mut outbound_rx: mpsc::Receiver<WsMessage>,
+) {
+    let mut retry_after = Duration::from_secs(1);
+
+    loop {
+        match run_gateway_session(&connection, &token, &mut outbound_rx).await {
+            Ok(()) => warn!(server_url = %connection.server_url, "gateway websocket session ended"),
+            Err(err) => {
+                warn!(server_url = %connection.server_url, error = %err, "gateway reconnect failed")
+            }
+        }
+
+        let was_connected = !connection.closed.load(Ordering::Acquire);
+        close_gateway_connection(&connection, "gateway disconnected");
+        while outbound_rx.try_recv().is_ok() {}
+        if was_connected {
+            retry_after = Duration::from_secs(1);
+        }
+        sleep(retry_after).await;
+        retry_after = (retry_after * 2).min(Duration::from_secs(30));
+    }
+}
+
+async fn run_gateway_session(
+    connection: &Arc<GatewayConnection>,
+    token: &str,
+    outbound_rx: &mut mpsc::Receiver<WsMessage>,
+) -> Result<()> {
+    let server_url = connection.server_url.clone();
+    let (ws, _) = connect_async(server_url.as_str()).await?;
     let (mut ws_sender, mut ws_receiver) = ws.split();
 
     ws_sender
         .send(WsMessage::Text(encode_message(&Message::RegisterAccess {
-            token: config.access.token.clone(),
+            token: token.to_string(),
         })?))
         .await?;
 
@@ -111,38 +255,31 @@ async fn connect_registered(config: &AccessConfig) -> Result<Arc<GatewayConnecti
         other => return Err(anyhow!("unexpected register response: {other:?}")),
     }
 
-    let (outbound, mut outbound_rx) = mpsc::channel::<WsMessage>(1024);
-    let connection = GatewayConnection {
-        outbound: outbound.clone(),
-        stream_ids: AtomicU64::new(1),
-        tcp_streams: DashMap::new(),
-        open_waiters: DashMap::new(),
-        http_waiters: DashMap::new(),
-    };
-    let connection = Arc::new(connection);
+    connection.closed.store(false, Ordering::Release);
+    info!(server_url = %server_url, "gateway connected");
 
-    tokio::spawn(async move {
-        while let Some(message) = outbound_rx.recv().await {
-            if ws_sender.send(message).await.is_err() {
-                break;
+    loop {
+        tokio::select! {
+            message = outbound_rx.recv() => {
+                let Some(message) = message else {
+                    return Err(anyhow!("gateway outbound channel closed"));
+                };
+
+                ws_sender
+                    .send(message)
+                    .await
+                    .context("gateway websocket write failed")?;
+            }
+            frame = ws_receiver.next() => {
+                let Some(frame) = frame else {
+                    return Err(anyhow!("gateway websocket closed"));
+                };
+
+                let frame = frame.context("gateway websocket read failed")?;
+                handle_gateway_frame(connection, frame).await;
             }
         }
-    });
-
-    let reader_connection = connection.clone();
-    tokio::spawn(async move {
-        while let Some(frame) = ws_receiver.next().await {
-            match frame {
-                Ok(frame) => handle_gateway_frame(&reader_connection, frame).await,
-                Err(err) => {
-                    warn!(error = %err, "gateway websocket read failed");
-                    break;
-                }
-            }
-        }
-    });
-
-    Ok(connection)
+    }
 }
 
 async fn handle_gateway_frame(connection: &GatewayConnection, frame: WsMessage) {
@@ -235,21 +372,29 @@ async fn handle_tcp_connection(
     listener: ListenerConfig,
     socket: TcpStream,
 ) -> Result<()> {
-    let stream_id = next_stream_id(&state);
+    let connection = state
+        .connections
+        .for_listener(&listener, state.default_server_url.as_deref())?;
+    let stream_id = next_stream_id(&connection);
+    ensure_gateway_open(&connection)?;
     let target = listener.target_name();
     let target_config = listener.target_config();
     let (open_tx, open_rx) = oneshot::channel();
-    state.connection.open_waiters.insert(stream_id, open_tx);
+    connection.open_waiters.insert(stream_id, open_tx);
 
-    send_text(
-        &state.connection,
+    if let Err(err) = send_text(
+        &connection,
         &Message::Open {
             stream_id,
             target,
             config: target_config,
         },
     )
-    .await?;
+    .await
+    {
+        connection.open_waiters.remove(&stream_id);
+        return Err(err);
+    }
 
     match open_rx.await? {
         Ok(()) => {}
@@ -257,7 +402,7 @@ async fn handle_tcp_connection(
     }
 
     let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(256);
-    state.connection.tcp_streams.insert(stream_id, write_tx);
+    connection.tcp_streams.insert(stream_id, write_tx);
 
     let (mut local_read, mut local_write) = socket.into_split();
     let mut local_buf = vec![0_u8; 16 * 1024];
@@ -267,10 +412,10 @@ async fn handle_tcp_connection(
             read = local_read.read(&mut local_buf) => {
                 let n = read?;
                 if n == 0 {
-                    send_text(&state.connection, &Message::Close { stream_id, reason: "local_closed".to_string() }).await?;
+                    send_text(&connection, &Message::Close { stream_id, reason: "local_closed".to_string() }).await?;
                     break;
                 }
-                state.connection.outbound.send(WsMessage::Binary(encode_data_frame(stream_id, &local_buf[..n]))).await?;
+                send_binary(&connection, stream_id, &local_buf[..n]).await?;
             }
             Some(bytes) = write_rx.recv() => {
                 local_write.write_all(&bytes).await?;
@@ -279,7 +424,7 @@ async fn handle_tcp_connection(
         }
     }
 
-    state.connection.tcp_streams.remove(&stream_id);
+    connection.tcp_streams.remove(&stream_id);
     Ok(())
 }
 
@@ -293,9 +438,92 @@ async fn run_http_listener(state: AppState, listener: ListenerConfig) -> Result<
         .fallback(any(handle_http_request))
         .with_state(http_state);
     let tcp_listener = TcpListener::bind(addr).await?;
-    info!(name = %listener.name, listen = %listener.listen, target = %listener.host, port = listener.port, "http listener started");
-    axum::serve(tcp_listener, app).await?;
+
+    if listener.local_scheme.as_deref() == Some("https") {
+        if !listener.auto_cert {
+            return Err(anyhow!(
+                "listener '{}' uses local_scheme=https but auto_cert is false",
+                listener.name
+            ));
+        }
+
+        info!(name = %listener.name, listen = %listener.listen, host = %listener.host, target = %listener.host, port = listener.port, "https listener started with in-memory self-signed certificate");
+        serve_https_listener(tcp_listener, app, &listener.host).await?;
+    } else {
+        info!(name = %listener.name, listen = %listener.listen, target = %listener.host, port = listener.port, "http listener started");
+        axum::serve(tcp_listener, app).await?;
+    }
+
     Ok(())
+}
+
+async fn serve_https_listener(tcp_listener: TcpListener, app: Router, host: &str) -> Result<()> {
+    let tls_acceptor = TlsAcceptor::from(Arc::new(self_signed_tls_config(host)?));
+    let host = host.to_string();
+
+    loop {
+        let (mut socket, peer) = tcp_listener.accept().await?;
+        let tls_acceptor = tls_acceptor.clone();
+        let app = app.clone();
+        let host = host.clone();
+
+        tokio::spawn(async move {
+            if let Err(err) = reject_plain_http_on_https(&mut socket, &host).await {
+                warn!(peer = %peer, error = %err, "failed to reject plain http on https listener");
+                return;
+            }
+
+            let tls_stream = match tls_acceptor.accept(socket).await {
+                Ok(stream) => stream,
+                Err(err) => {
+                    warn!(peer = %peer, error = %err, "tls handshake failed");
+                    return;
+                }
+            };
+
+            let service = TowerToHyperService::new(app);
+            let io = TokioIo::new(tls_stream);
+            if let Err(err) = HyperBuilder::new(TokioExecutor::new())
+                .serve_connection(io, service)
+                .await
+            {
+                warn!(peer = %peer, error = %err, "https connection failed");
+            }
+        });
+    }
+}
+
+async fn reject_plain_http_on_https(socket: &mut TcpStream, host: &str) -> Result<()> {
+    let mut first = [0_u8; 1];
+    let read = socket.peek(&mut first).await?;
+    if read == 0 || first[0] == 0x16 {
+        return Ok(());
+    }
+
+    let response = format!(
+        "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\nThis listener expects HTTPS. Open https://{host}/ instead of http://{host}/.\r\n"
+    );
+    socket.write_all(response.as_bytes()).await?;
+    Err(anyhow!("plain HTTP request received on HTTPS listener"))
+}
+
+fn self_signed_tls_config(host: &str) -> Result<rustls::ServerConfig> {
+    let mut params = CertificateParams::new(vec![host.to_string()]);
+    params.distinguished_name = DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(DnType::CommonName, host.to_string());
+    params
+        .subject_alt_names
+        .push(SanType::DnsName(host.to_string()));
+
+    let cert = rcgen::Certificate::from_params(params)?;
+    let cert_der = CertificateDer::from(cert.serialize_der()?);
+    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.serialize_private_key_der()));
+
+    Ok(rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der)?)
 }
 
 async fn handle_http_request(
@@ -305,6 +533,14 @@ async fn handle_http_request(
     match handle_http_request_result(state, request).await {
         Ok(response) => response,
         Err(err) => {
+            if is_gateway_disconnected_error(&err) {
+                return Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .header("connection", "close")
+                    .body(Body::from("gateway disconnected"))
+                    .unwrap();
+            }
+
             error!(error = %err, "http proxy request failed");
             Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
@@ -318,7 +554,12 @@ async fn handle_http_request_result(
     state: HttpListenerState,
     request: Request<Body>,
 ) -> Result<Response<Body>> {
-    let stream_id = next_stream_id(&state.app);
+    let connection = state
+        .app
+        .connections
+        .for_listener(&state.listener, state.app.default_server_url.as_deref())?;
+    let stream_id = next_stream_id(&connection);
+    ensure_gateway_open(&connection)?;
     let (parts, body) = request.into_parts();
     let body = to_bytes(body, 32 * 1024 * 1024).await?.to_vec();
     let path_and_query = parts
@@ -347,14 +588,10 @@ async fn handle_http_request_result(
     let target = state.listener.target_name();
     let target_config = state.listener.target_config();
     let (response_tx, response_rx) = oneshot::channel();
-    state
-        .app
-        .connection
-        .http_waiters
-        .insert(stream_id, response_tx);
+    connection.http_waiters.insert(stream_id, response_tx);
 
-    send_text(
-        &state.app.connection,
+    if let Err(err) = send_text(
+        &connection,
         &Message::HttpRequest {
             stream_id,
             target,
@@ -362,7 +599,11 @@ async fn handle_http_request_result(
             request: request_payload,
         },
     )
-    .await?;
+    .await
+    {
+        connection.http_waiters.remove(&stream_id);
+        return Err(err);
+    }
 
     let response = match response_rx.await? {
         Ok(response) => response,
@@ -402,11 +643,78 @@ fn response_headers_to_skip() -> HashSet<&'static str> {
 }
 
 async fn send_text(connection: &GatewayConnection, message: &Message) -> Result<()> {
+    ensure_gateway_open(connection)?;
     connection
         .outbound
         .send(WsMessage::Text(encode_message(message)?))
         .await?;
     Ok(())
+}
+
+async fn send_binary(
+    connection: &GatewayConnection,
+    stream_id: StreamId,
+    bytes: &[u8],
+) -> Result<()> {
+    ensure_gateway_open(connection)?;
+    connection
+        .outbound
+        .send(WsMessage::Binary(encode_data_frame(stream_id, bytes)))
+        .await?;
+    Ok(())
+}
+
+fn ensure_gateway_open(connection: &GatewayConnection) -> Result<()> {
+    if connection.closed.load(Ordering::Acquire) || connection.outbound.is_closed() {
+        return Err(anyhow!("gateway disconnected"));
+    }
+
+    Ok(())
+}
+
+fn is_gateway_disconnected_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        matches!(
+            cause.to_string().as_str(),
+            "gateway disconnected"
+                | "gateway websocket closed"
+                | "gateway websocket write failed"
+                | "gateway error gateway websocket closed"
+                | "gateway error gateway websocket write failed"
+        )
+    })
+}
+
+fn close_gateway_connection(connection: &GatewayConnection, reason: &str) {
+    if connection.closed.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    connection.tcp_streams.clear();
+
+    let open_waiters = connection
+        .open_waiters
+        .iter()
+        .map(|entry| *entry.key())
+        .collect::<Vec<_>>();
+    for stream_id in open_waiters {
+        if let Some((_, tx)) = connection.open_waiters.remove(&stream_id) {
+            let _ = tx.send(Err(reason.to_string()));
+        }
+    }
+
+    let http_waiters = connection
+        .http_waiters
+        .iter()
+        .map(|entry| *entry.key())
+        .collect::<Vec<_>>();
+    for stream_id in http_waiters {
+        if let Some((_, tx)) = connection.http_waiters.remove(&stream_id) {
+            let _ = tx.send(Err(reason.to_string()));
+        }
+    }
+
+    warn!(server_url = %connection.server_url, reason = %reason, "gateway connection closed");
 }
 
 fn decode_ws_message(message: WsMessage) -> Result<Message> {
@@ -417,6 +725,6 @@ fn decode_ws_message(message: WsMessage) -> Result<Message> {
     }
 }
 
-fn next_stream_id(state: &AppState) -> StreamId {
-    state.connection.stream_ids.fetch_add(1, Ordering::Relaxed)
+fn next_stream_id(connection: &GatewayConnection) -> StreamId {
+    connection.stream_ids.fetch_add(1, Ordering::Relaxed)
 }

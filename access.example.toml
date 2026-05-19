@@ -12,6 +12,7 @@ port = 3306
 [[listeners]]
 name = "redis"
 mode = "tcp"
+server_url = "ws://127.0.0.1:8444/tunnel"
 listen = "127.0.0.1:63790"
 host = "10.0.0.11"
 port = 6379
@@ -24,6 +25,22 @@ scheme = "https"
 host = "admin.internal.local"
 port = 443
 # Set true only for internal HTTPS services with self-signed or name-mismatched certificates.
+accept_invalid_certs = false
+rewrite_location = true
+rewrite_cookie = true
+
+# Local HTTPS listener with an in-memory self-signed certificate.
+# Add a hosts entry such as: 127.0.0.1 admin.internal.local
+# Then open: https://admin.internal.local:18443
+[[listeners]]
+name = "admin-local-https"
+mode = "http"
+listen = "127.0.0.1:18443"
+local_scheme = "https"
+auto_cert = true
+scheme = "https"
+host = "admin.internal.local"
+port = 443
 accept_invalid_certs = false
 rewrite_location = true
 rewrite_cookie = true

@@ -39,6 +39,7 @@ type TcpStreams = Arc<DashMap<u64, mpsc::Sender<Vec<u8>>>>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    install_rustls_crypto_provider();
     tracing_subscriber::fmt().with_env_filter("info").init();
 
     let args = Args::parse();
@@ -62,6 +63,10 @@ async fn main() -> Result<()> {
     info!(listen = %config.gateway.listen, path = %config.gateway.path, "gateway listening");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn install_rustls_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 async fn ws_entry(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
