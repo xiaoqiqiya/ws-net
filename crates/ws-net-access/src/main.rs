@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     net::SocketAddr,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -369,7 +370,13 @@ async fn handle_http_request_result(
     };
 
     let mut builder = Response::builder().status(response.status);
+    let skip_headers = response_headers_to_skip();
     for (name, value) in response.headers {
+        let lower = name.to_ascii_lowercase();
+        if skip_headers.contains(lower.as_str()) {
+            continue;
+        }
+
         if let (Ok(name), Ok(value)) = (
             HeaderName::from_bytes(name.as_bytes()),
             HeaderValue::from_str(&value),
@@ -378,6 +385,20 @@ async fn handle_http_request_result(
         }
     }
     Ok(builder.body(Body::from(response.body))?)
+}
+
+fn response_headers_to_skip() -> HashSet<&'static str> {
+    HashSet::from([
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "content-length",
+    ])
 }
 
 async fn send_text(connection: &GatewayConnection, message: &Message) -> Result<()> {

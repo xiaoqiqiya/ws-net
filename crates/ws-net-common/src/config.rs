@@ -30,6 +30,8 @@ pub struct TargetConfig {
     pub port: u16,
     pub scheme: Option<String>,
     #[serde(default)]
+    pub accept_invalid_certs: bool,
+    #[serde(default)]
     pub rewrite_location: bool,
     #[serde(default)]
     pub rewrite_cookie: bool,
@@ -57,6 +59,8 @@ pub struct ListenerConfig {
     pub port: u16,
     pub scheme: Option<String>,
     #[serde(default)]
+    pub accept_invalid_certs: bool,
+    #[serde(default)]
     pub rewrite_location: bool,
     #[serde(default)]
     pub rewrite_cookie: bool,
@@ -73,6 +77,7 @@ impl ListenerConfig {
             host: self.host.clone(),
             port: self.port,
             scheme: self.scheme.clone(),
+            accept_invalid_certs: self.accept_invalid_certs,
             rewrite_location: self.rewrite_location,
             rewrite_cookie: self.rewrite_cookie,
         }

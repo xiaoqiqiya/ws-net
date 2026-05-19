@@ -31,6 +31,7 @@ struct Args {
 struct AppState {
     config: Arc<GatewayConfig>,
     http: reqwest::Client,
+    http_insecure: reqwest::Client,
 }
 
 type Outbound = mpsc::Sender<axum::extract::ws::Message>;
@@ -46,6 +47,10 @@ async fn main() -> Result<()> {
         config: config.clone(),
         http: reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .build()?,
+        http_insecure: reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .danger_accept_invalid_certs(true)
             .build()?,
     };
 
@@ -196,7 +201,7 @@ async fn handle_text_message(
                             &outbound,
                             Some(stream_id),
                             "HTTP_TARGET_ERROR",
-                            &err.to_string(),
+                            &format_error_chain(&err),
                         )
                         .await;
                     }
@@ -293,7 +298,12 @@ async fn handle_http_request(
         scheme, target.host, target.port, request.path_and_query
     );
     let method = reqwest::Method::from_bytes(request.method.as_bytes())?;
-    let mut builder = state.http.request(method, &url);
+    let client = if target.accept_invalid_certs {
+        &state.http_insecure
+    } else {
+        &state.http
+    };
+    let mut builder = client.request(method, &url);
 
     let skip_headers = hop_by_hop_headers();
     for (name, value) in &request.headers {
@@ -310,8 +320,14 @@ async fn handle_http_request(
     let response = builder.send().await?;
     let status = response.status().as_u16();
     let mut headers = Vec::new();
+    let skip_headers = response_headers_to_skip();
     for (name, value) in response.headers() {
         let name = name.as_str().to_string();
+        let lower = name.to_ascii_lowercase();
+        if skip_headers.contains(lower.as_str()) {
+            continue;
+        }
+
         if let Ok(value) = value.to_str() {
             let value = rewrite_header(target, &name, value);
             headers.push((name, value));
@@ -324,6 +340,13 @@ async fn handle_http_request(
         headers,
         body,
     })
+}
+
+fn format_error_chain(err: &anyhow::Error) -> String {
+    err.chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
 }
 
 fn rewrite_header(target: &TargetConfig, name: &str, value: &str) -> String {
@@ -360,6 +383,12 @@ fn hop_by_hop_headers() -> HashSet<&'static str> {
         "transfer-encoding",
         "upgrade",
     ])
+}
+
+fn response_headers_to_skip() -> HashSet<&'static str> {
+    let mut headers = hop_by_hop_headers();
+    headers.insert("content-length");
+    headers
 }
 
 async fn send_text(outbound: &Outbound, message: &Message) -> Result<()> {
