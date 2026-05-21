@@ -31,7 +31,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::{mpsc, oneshot},
-    time::sleep,
+    time::{interval, sleep, Instant, MissedTickBehavior},
 };
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
@@ -44,6 +44,8 @@ use ws_net_common::{
 
 const TCP_BUFFER_SIZE: usize = 128 * 1024;
 const TCP_STREAM_CHANNEL_CAPACITY: usize = 64;
+const GATEWAY_PING_INTERVAL: Duration = Duration::from_secs(20);
+const GATEWAY_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(75);
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -299,8 +301,22 @@ async fn run_gateway_session(
     connection.closed.store(false, Ordering::Release);
     info!(server_url = %server_url, "gateway connected");
 
+    let mut heartbeat = interval(GATEWAY_PING_INTERVAL);
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut last_received = Instant::now();
+
     loop {
         tokio::select! {
+            _ = heartbeat.tick() => {
+                if last_received.elapsed() > GATEWAY_READ_IDLE_TIMEOUT {
+                    return Err(anyhow!("gateway websocket read idle timeout"));
+                }
+
+                ws_sender
+                    .send(WsMessage::Text(encode_message(&Message::Ping)?))
+                    .await
+                    .context("gateway websocket heartbeat failed")?;
+            }
             message = outbound_rx.recv() => {
                 let Some(message) = message else {
                     return Err(anyhow!("gateway outbound channel closed"));
@@ -317,6 +333,7 @@ async fn run_gateway_session(
                 };
 
                 let frame = frame.context("gateway websocket read failed")?;
+                last_received = Instant::now();
                 handle_gateway_frame(connection, frame).await;
             }
         }
@@ -388,6 +405,7 @@ async fn handle_gateway_message(connection: &GatewayConnection, message: Message
         Message::Ping => {
             let _ = send_text(connection, &Message::Pong).await;
         }
+        Message::Pong => {}
         other => warn!(?other, "unexpected gateway message"),
     }
 }
