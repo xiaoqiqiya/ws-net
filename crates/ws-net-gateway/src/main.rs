@@ -14,6 +14,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::mpsc,
+    time::{interval, Duration, Instant, MissedTickBehavior},
 };
 use tracing::{info, warn};
 use ws_net_common::{
@@ -24,6 +25,8 @@ use ws_net_common::{
 
 const TCP_BUFFER_SIZE: usize = 128 * 1024;
 const TCP_STREAM_CHANNEL_CAPACITY: usize = 64;
+const ACCESS_PING_INTERVAL: Duration = Duration::from_secs(20);
+const ACCESS_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(75);
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -123,21 +126,48 @@ async fn handle_socket_result(socket: axum::extract::ws::WebSocket, state: AppSt
     });
 
     let streams: TcpStreams = Arc::new(DashMap::new());
+    let mut heartbeat = interval(ACCESS_PING_INTERVAL);
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut last_received = Instant::now();
 
-    while let Some(frame) = ws_receiver.next().await {
-        match frame? {
-            axum::extract::ws::Message::Text(text) => {
-                handle_text_message(&state, &outbound, &streams, &text).await?;
+    loop {
+        tokio::select! {
+            _ = heartbeat.tick() => {
+                if last_received.elapsed() > ACCESS_READ_IDLE_TIMEOUT {
+                    return Err(anyhow!("access websocket read idle timeout"));
+                }
+
+                outbound
+                    .send(axum::extract::ws::Message::Ping(Vec::new()))
+                    .await?;
             }
-            axum::extract::ws::Message::Binary(bytes) => {
-                if let Some((stream_id, payload)) = decode_data_frame_owned(bytes) {
-                    if let Some(tx) = streams.get(&stream_id).map(|entry| entry.value().clone()) {
-                        let _ = tx.send(payload).await;
+            frame = ws_receiver.next() => {
+                let Some(frame) = frame else {
+                    break;
+                };
+
+                last_received = Instant::now();
+                match frame? {
+                    axum::extract::ws::Message::Text(text) => {
+                        handle_text_message(&state, &outbound, &streams, &text).await?;
                     }
+                    axum::extract::ws::Message::Binary(bytes) => {
+                        if let Some((stream_id, payload)) = decode_data_frame_owned(bytes) {
+                            if let Some(tx) = streams.get(&stream_id).map(|entry| entry.value().clone()) {
+                                let _ = tx.send(payload).await;
+                            }
+                        }
+                    }
+                    axum::extract::ws::Message::Ping(payload) => {
+                        outbound
+                            .send(axum::extract::ws::Message::Pong(payload))
+                            .await?;
+                    }
+                    axum::extract::ws::Message::Pong(_) => {}
+                    axum::extract::ws::Message::Close(_) => break,
                 }
             }
-            axum::extract::ws::Message::Close(_) => break,
-            _ => {}
+            else => break,
         }
     }
 

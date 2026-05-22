@@ -1,11 +1,12 @@
 use std::{
     collections::HashSet,
     net::SocketAddr,
+    path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -30,8 +31,8 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{mpsc, oneshot},
-    time::{interval, sleep, Instant, MissedTickBehavior},
+    sync::{mpsc, oneshot, Notify, RwLock},
+    time::{interval, sleep, timeout, Instant, MissedTickBehavior},
 };
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
@@ -46,6 +47,9 @@ const TCP_BUFFER_SIZE: usize = 128 * 1024;
 const TCP_STREAM_CHANNEL_CAPACITY: usize = 64;
 const GATEWAY_PING_INTERVAL: Duration = Duration::from_secs(20);
 const GATEWAY_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(75);
+const GATEWAY_READY_TIMEOUT: Duration = Duration::from_secs(10);
+const ACCESS_CONFIG_RELOAD_INTERVAL: Duration = Duration::from_secs(2);
+const ACCESS_CONFIG_RELOAD_DEBOUNCE: Duration = Duration::from_millis(300);
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -55,8 +59,9 @@ struct Args {
 
 #[derive(Clone)]
 struct AppState {
-    default_server_url: Option<String>,
-    connections: Arc<GatewayConnections>,
+    config: Arc<RwLock<AccessConfig>>,
+    default_server_url: Arc<RwLock<Option<String>>>,
+    connections: Arc<RwLock<Arc<GatewayConnections>>>,
 }
 
 #[derive(Clone)]
@@ -69,6 +74,10 @@ struct GatewayConnection {
     server_url: String,
     outbound: mpsc::Sender<WsMessage>,
     closed: AtomicBool,
+    stopped: AtomicBool,
+    reconnect_requested: AtomicBool,
+    reconnect_now: Notify,
+    connected: Notify,
     stream_ids: AtomicU64,
     tcp_streams: DashMap<StreamId, mpsc::Sender<DataFramePayload>>,
     open_waiters: DashMap<StreamId, oneshot::Sender<Result<(), String>>>,
@@ -158,29 +167,22 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
 
     let args = Args::parse();
-    let config = Arc::new(AccessConfig::load(&args.config).context("load access config")?);
+    let config_path = PathBuf::from(&args.config);
+    let config = AccessConfig::load(&config_path).context("load access config")?;
     let connections = connect_all_registered(&config).await?;
-    let default_server_url = config
-        .access
-        .server_url
-        .as_deref()
-        .map(str::trim)
-        .and_then(|url| {
-            if url.is_empty() {
-                None
-            } else {
-                Some(url.to_string())
-            }
-        });
+    let default_server_url = default_server_url(&config);
     for listener in &config.listeners {
         connections
             .for_listener(listener, default_server_url.as_deref())
             .with_context(|| format!("validate listener '{}' gateway", listener.name))?;
     }
     let state = AppState {
-        default_server_url,
-        connections,
+        config: Arc::new(RwLock::new(config.clone())),
+        default_server_url: Arc::new(RwLock::new(default_server_url)),
+        connections: Arc::new(RwLock::new(connections)),
     };
+
+    tokio::spawn(watch_access_config(config_path, state.clone()));
 
     for listener in config.listeners.clone() {
         let state = state.clone();
@@ -210,6 +212,86 @@ fn install_rustls_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+fn default_server_url(config: &AccessConfig) -> Option<String> {
+    config
+        .access
+        .server_url
+        .as_deref()
+        .map(str::trim)
+        .and_then(|url| {
+            if url.is_empty() {
+                None
+            } else {
+                Some(url.to_string())
+            }
+        })
+}
+
+async fn watch_access_config(config_path: PathBuf, state: AppState) {
+    let mut last_modified = config_modified_at(&config_path).ok();
+    let mut reload_interval = interval(ACCESS_CONFIG_RELOAD_INTERVAL);
+    reload_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    loop {
+        reload_interval.tick().await;
+        let modified = match config_modified_at(&config_path) {
+            Ok(modified) => modified,
+            Err(err) => {
+                warn!(path = %config_path.display(), error = %err, "failed to stat access config");
+                continue;
+            }
+        };
+
+        if last_modified == Some(modified) {
+            continue;
+        }
+
+        last_modified = Some(modified);
+        sleep(ACCESS_CONFIG_RELOAD_DEBOUNCE).await;
+
+        match reload_access_config(&config_path, &state).await {
+            Ok(()) => info!(path = %config_path.display(), "access config reloaded"),
+            Err(err) => {
+                warn!(path = %config_path.display(), error = %err, "failed to reload access config")
+            }
+        }
+    }
+}
+
+fn config_modified_at(config_path: &PathBuf) -> Result<SystemTime> {
+    Ok(std::fs::metadata(config_path)?.modified()?)
+}
+
+async fn reload_access_config(config_path: &PathBuf, state: &AppState) -> Result<()> {
+    let config = AccessConfig::load(config_path).context("load access config")?;
+    let connections = connect_all_registered(&config).await?;
+    let default_server_url = default_server_url(&config);
+
+    let current_config = state.config.read().await;
+    for listener in &current_config.listeners {
+        let updated_listener = config
+            .listeners
+            .iter()
+            .find(|candidate| candidate.name == listener.name)
+            .unwrap_or(listener);
+        connections
+            .for_listener(updated_listener, default_server_url.as_deref())
+            .with_context(|| format!("validate listener '{}' gateway", listener.name))?;
+    }
+    drop(current_config);
+
+    let old_connections = {
+        let mut current_connections = state.connections.write().await;
+        std::mem::replace(&mut *current_connections, connections)
+    };
+    stop_gateway_connections(&old_connections, "access config reloaded").await;
+
+    *state.config.write().await = config;
+    *state.default_server_url.write().await = default_server_url;
+
+    Ok(())
+}
+
 async fn connect_all_registered(config: &AccessConfig) -> Result<Arc<GatewayConnections>> {
     let mut pools = Vec::new();
     let pool_size = config.access.gateway_pool_size.max(1);
@@ -230,6 +312,10 @@ fn start_gateway_connection(config: &AccessConfig, server_url: String) -> Arc<Ga
         server_url,
         outbound,
         closed: AtomicBool::new(true),
+        stopped: AtomicBool::new(false),
+        reconnect_requested: AtomicBool::new(false),
+        reconnect_now: Notify::new(),
+        connected: Notify::new(),
         stream_ids: AtomicU64::new(1),
         tcp_streams: DashMap::new(),
         open_waiters: DashMap::new(),
@@ -252,7 +338,7 @@ async fn run_gateway_connection(
 ) {
     let mut retry_after = Duration::from_secs(1);
 
-    loop {
+    while !connection.stopped.load(Ordering::Acquire) {
         match run_gateway_session(&connection, &token, &mut outbound_rx).await {
             Ok(()) => warn!(server_url = %connection.server_url, "gateway websocket session ended"),
             Err(err) => {
@@ -266,9 +352,18 @@ async fn run_gateway_connection(
         if was_connected {
             retry_after = Duration::from_secs(1);
         }
-        sleep(retry_after).await;
+        if !connection.reconnect_requested.swap(false, Ordering::AcqRel) {
+            tokio::select! {
+                _ = sleep(retry_after) => {}
+                _ = connection.reconnect_now.notified() => {
+                    connection.reconnect_requested.store(false, Ordering::Release);
+                }
+            }
+        }
         retry_after = (retry_after * 2).min(Duration::from_secs(30));
     }
+
+    close_gateway_connection(&connection, "gateway connection stopped");
 }
 
 async fn run_gateway_session(
@@ -299,6 +394,7 @@ async fn run_gateway_session(
     }
 
     connection.closed.store(false, Ordering::Release);
+    connection.connected.notify_waiters();
     info!(server_url = %server_url, "gateway connected");
 
     let mut heartbeat = interval(GATEWAY_PING_INTERVAL);
@@ -307,13 +403,16 @@ async fn run_gateway_session(
 
     loop {
         tokio::select! {
+            _ = connection.reconnect_now.notified(), if connection.stopped.load(Ordering::Acquire) => {
+                return Err(anyhow!("gateway connection stopped"));
+            }
             _ = heartbeat.tick() => {
                 if last_received.elapsed() > GATEWAY_READ_IDLE_TIMEOUT {
                     return Err(anyhow!("gateway websocket read idle timeout"));
                 }
 
                 ws_sender
-                    .send(WsMessage::Text(encode_message(&Message::Ping)?))
+                    .send(WsMessage::Ping(Vec::new()))
                     .await
                     .context("gateway websocket heartbeat failed")?;
             }
@@ -356,6 +455,13 @@ async fn handle_gateway_frame(connection: &GatewayConnection, frame: WsMessage) 
                     let _ = tx.send(payload).await;
                 }
             }
+        }
+        WsMessage::Ping(payload) => {
+            let _ = connection.outbound.send(WsMessage::Pong(payload)).await;
+        }
+        WsMessage::Pong(_) => {}
+        WsMessage::Close(_) => {
+            close_gateway_connection(connection, "gateway websocket closed");
         }
         _ => {}
     }
@@ -426,6 +532,18 @@ async fn run_tcp_listener(state: AppState, listener: ListenerConfig) -> Result<(
     }
 }
 
+async fn current_listener(state: &AppState, fallback: &ListenerConfig) -> ListenerConfig {
+    state
+        .config
+        .read()
+        .await
+        .listeners
+        .iter()
+        .find(|listener| listener.name == fallback.name)
+        .cloned()
+        .unwrap_or_else(|| fallback.clone())
+}
+
 async fn handle_tcp_connection(
     state: AppState,
     listener: ListenerConfig,
@@ -433,11 +551,12 @@ async fn handle_tcp_connection(
 ) -> Result<()> {
     socket.set_nodelay(true)?;
 
-    let connection = state
-        .connections
-        .for_listener(&listener, state.default_server_url.as_deref())?;
+    let listener = current_listener(&state, &listener).await;
+    let default_server_url = state.default_server_url.read().await.clone();
+    let connections = state.connections.read().await.clone();
+    let connection = connections.for_listener(&listener, default_server_url.as_deref())?;
     let stream_id = next_stream_id(&connection);
-    ensure_gateway_open(&connection)?;
+    ensure_gateway_ready(&connection).await?;
     let target = listener.target_name();
     let target_config = listener.target_config();
     let (open_tx, open_rx) = oneshot::channel();
@@ -628,12 +747,12 @@ async fn handle_http_request_result(
     state: HttpListenerState,
     request: Request<Body>,
 ) -> Result<Response<Body>> {
-    let connection = state
-        .app
-        .connections
-        .for_listener(&state.listener, state.app.default_server_url.as_deref())?;
+    let listener = current_listener(&state.app, &state.listener).await;
+    let default_server_url = state.app.default_server_url.read().await.clone();
+    let connections = state.app.connections.read().await.clone();
+    let connection = connections.for_listener(&listener, default_server_url.as_deref())?;
     let stream_id = next_stream_id(&connection);
-    ensure_gateway_open(&connection)?;
+    ensure_gateway_ready(&connection).await?;
     let (parts, body) = request.into_parts();
     let body = to_bytes(body, 32 * 1024 * 1024).await?.to_vec();
     let path_and_query = parts
@@ -737,6 +856,42 @@ fn ensure_gateway_open(connection: &GatewayConnection) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn ensure_gateway_ready(connection: &GatewayConnection) -> Result<()> {
+    if ensure_gateway_open(connection).is_ok() {
+        return Ok(());
+    }
+
+    connection
+        .reconnect_requested
+        .store(true, Ordering::Release);
+    connection.reconnect_now.notify_one();
+
+    let wait_connected = async {
+        loop {
+            if ensure_gateway_open(connection).is_ok() {
+                return;
+            }
+            connection.connected.notified().await;
+        }
+    };
+
+    match timeout(GATEWAY_READY_TIMEOUT, wait_connected).await {
+        Ok(()) => ensure_gateway_open(connection),
+        Err(_) => Err(anyhow!("gateway disconnected")),
+    }
+}
+
+async fn stop_gateway_connections(connections: &GatewayConnections, reason: &str) {
+    for pool in &connections.pools {
+        for connection in &pool.connections {
+            connection.stopped.store(true, Ordering::Release);
+            connection.reconnect_now.notify_waiters();
+            let _ = connection.outbound.send(WsMessage::Close(None)).await;
+            close_gateway_connection(connection, reason);
+        }
+    }
 }
 
 fn is_gateway_disconnected_error(err: &anyhow::Error) -> bool {
