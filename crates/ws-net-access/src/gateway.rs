@@ -135,8 +135,14 @@ async fn run_gateway_session(
 
     loop {
         tokio::select! {
-            _ = connection.reconnect_now.notified(), if connection.stopped.load(Ordering::Acquire) => {
-                return Err(anyhow!("gateway connection stopped"));
+            _ = connection.reconnect_now.notified() => {
+                if connection.stopped.load(Ordering::Acquire) {
+                    return Err(anyhow!("gateway connection stopped"));
+                }
+
+                if connection.reconnect_requested.load(Ordering::Acquire) {
+                    return Err(anyhow!("gateway reconnect requested"));
+                }
             }
             _ = heartbeat.tick() => {
                 if last_received.elapsed() > GATEWAY_READ_IDLE_TIMEOUT {

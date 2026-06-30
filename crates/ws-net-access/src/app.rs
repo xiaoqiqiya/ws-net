@@ -101,16 +101,32 @@ impl GatewayConnectionPool {
 
     fn next_connection(&self) -> Arc<GatewayConnection> {
         let start = self.next.fetch_add(1, Ordering::Relaxed);
+        let mut best: Option<Arc<GatewayConnection>> = None;
+        let mut best_load = usize::MAX;
+        let mut best_capacity = 0;
 
         for offset in 0..self.connections.len() {
             let connection = &self.connections[(start + offset) % self.connections.len()];
             if !connection.closed.load(Ordering::Acquire) && !connection.outbound.is_closed() {
-                return connection.clone();
+                let load = connection_load(connection);
+                let capacity = connection.outbound.capacity();
+                if best.is_none()
+                    || load < best_load
+                    || (load == best_load && capacity > best_capacity)
+                {
+                    best = Some(connection.clone());
+                    best_load = load;
+                    best_capacity = capacity;
+                }
             }
         }
 
-        self.connections[start % self.connections.len()].clone()
+        best.unwrap_or_else(|| self.connections[start % self.connections.len()].clone())
     }
+}
+
+fn connection_load(connection: &GatewayConnection) -> usize {
+    connection.tcp_streams.len() + connection.open_waiters.len() + connection.http_waiters.len()
 }
 
 pub(crate) fn default_server_url(config: &AccessConfig) -> Option<String> {

@@ -75,7 +75,11 @@ async fn handle_tcp_stream_result(
                 };
                 outbound.send(axum::extract::ws::Message::Binary(frame)).await?;
             }
-            Some(bytes) = write_rx.recv() => {
+            bytes = write_rx.recv() => {
+                let Some(bytes) = bytes else {
+                    info!(stream_id, target = %target_name, "tcp stream access side closed");
+                    break;
+                };
                 tcp_write.write_all(bytes.as_slice()).await?;
             }
             else => break,

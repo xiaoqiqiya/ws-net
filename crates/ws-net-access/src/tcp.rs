@@ -100,7 +100,11 @@ async fn handle_tcp_connection(
                 };
                 send_binary(&connection, frame).await?;
             }
-            Some(bytes) = write_rx.recv() => {
+            bytes = write_rx.recv() => {
+                let Some(bytes) = bytes else {
+                    info!(stream_id, listener = %listener.name, "tcp stream remote side closed");
+                    break;
+                };
                 local_write.write_all(bytes.as_slice()).await?;
             }
             else => break,
