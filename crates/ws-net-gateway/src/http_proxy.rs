@@ -1,15 +1,23 @@
 use std::collections::HashSet;
 
 use anyhow::Result;
-use ws_net_common::{HttpRequestPayload, HttpResponsePayload, TargetConfig};
+use bytes::Bytes;
+use futures_util::future::BoxFuture;
+use futures_util::StreamExt;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use ws_net_common::{HttpRequestHead, HttpResponseHead, TargetConfig};
 
 use crate::app::AppState;
 
 pub(crate) async fn handle_http_request(
     state: &AppState,
     target: &TargetConfig,
-    request: &HttpRequestPayload,
-) -> Result<HttpResponsePayload> {
+    request: HttpRequestHead,
+    body_rx: mpsc::Receiver<Result<Bytes, std::io::Error>>,
+    on_response_head: impl FnOnce(HttpResponseHead) -> BoxFuture<'static, Result<()>>,
+    mut on_body_chunk: impl FnMut(Bytes) -> BoxFuture<'static, Result<()>>,
+) -> Result<()> {
     let scheme = target.scheme.as_deref().unwrap_or("http");
     let url = format!(
         "{}://{}:{}{}",
@@ -31,9 +39,8 @@ pub(crate) async fn handle_http_request(
         }
         builder = builder.header(name, value);
     }
-    builder = builder
-        .header("host", &target.host)
-        .body(request.body.clone());
+    let body = reqwest::Body::wrap_stream(ReceiverStream::new(body_rx));
+    builder = builder.header("host", &target.host).body(body);
 
     let response = builder.send().await?;
     let status = response.status().as_u16();
@@ -51,13 +58,14 @@ pub(crate) async fn handle_http_request(
             headers.push((name, value));
         }
     }
-    let body = response.bytes().await?.to_vec();
+    on_response_head(HttpResponseHead { status, headers }).await?;
 
-    Ok(HttpResponsePayload {
-        status,
-        headers,
-        body,
-    })
+    let mut body = response.bytes_stream();
+    while let Some(chunk) = body.next().await {
+        on_body_chunk(chunk?).await?;
+    }
+
+    Ok(())
 }
 
 fn rewrite_header(target: &TargetConfig, name: &str, value: &str) -> String {

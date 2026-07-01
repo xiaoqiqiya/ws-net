@@ -1,9 +1,11 @@
 use std::{
+    io,
     sync::{atomic::Ordering, Arc},
     time::Duration,
 };
 
 use anyhow::{anyhow, Context, Result};
+use bytes::Bytes;
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use tokio::{
@@ -52,6 +54,8 @@ fn start_gateway_connection(config: &AccessConfig, server_url: String) -> Arc<Ga
         tcp_streams: DashMap::new(),
         open_waiters: DashMap::new(),
         http_waiters: DashMap::new(),
+        http_head_waiters: DashMap::new(),
+        http_body_streams: DashMap::new(),
     });
 
     tokio::spawn(run_gateway_connection(
@@ -186,6 +190,25 @@ async fn handle_gateway_frame(connection: &GatewayConnection, frame: WsMessage) 
         WsMessage::Binary(bytes) => {
             if let Some((stream_id, payload)) = decode_data_frame_owned(bytes) {
                 if let Some(tx) = connection
+                    .http_body_streams
+                    .get(&stream_id)
+                    .map(|entry| entry.value().clone())
+                {
+                    if tx.try_send(Ok(Bytes::from(payload.into_vec()))).is_err() {
+                        connection.http_body_streams.remove(&stream_id);
+                        let _ = send_text(
+                            connection,
+                            &Message::Close {
+                                stream_id,
+                                reason: "local_backpressure".to_string(),
+                            },
+                        )
+                        .await;
+                    }
+                    return;
+                }
+
+                if let Some(tx) = connection
                     .tcp_streams
                     .get(&stream_id)
                     .map(|entry| entry.value().clone())
@@ -230,8 +253,30 @@ async fn handle_gateway_message(connection: &GatewayConnection, message: Message
                 let _ = tx.send(Ok(response));
             }
         }
+        Message::HttpResponseStart {
+            stream_id,
+            response,
+        } => {
+            if let Some((_, tx)) = connection.http_head_waiters.remove(&stream_id) {
+                let _ = tx.send(Ok(response));
+            }
+        }
+        Message::HttpResponseEnd { stream_id } => {
+            connection.http_body_streams.remove(&stream_id);
+        }
         Message::Close { stream_id, .. } => {
             connection.tcp_streams.remove(&stream_id);
+            if let Some((_, tx)) = connection.http_head_waiters.remove(&stream_id) {
+                let _ = tx.send(Err("stream closed".to_string()));
+            }
+            if let Some((_, tx)) = connection.http_body_streams.remove(&stream_id) {
+                let _ = tx
+                    .send(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "stream closed",
+                    )))
+                    .await;
+            }
             if let Some((_, tx)) = connection.open_waiters.remove(&stream_id) {
                 let _ = tx.send(Err("stream closed".to_string()));
             }
@@ -250,7 +295,15 @@ async fn handle_gateway_message(connection: &GatewayConnection, message: Message
                     let _ = tx.send(Err(error.clone()));
                 }
                 if let Some((_, tx)) = connection.http_waiters.remove(&stream_id) {
-                    let _ = tx.send(Err(error));
+                    let _ = tx.send(Err(error.clone()));
+                }
+                if let Some((_, tx)) = connection.http_head_waiters.remove(&stream_id) {
+                    let _ = tx.send(Err(error.clone()));
+                }
+                if let Some((_, tx)) = connection.http_body_streams.remove(&stream_id) {
+                    let _ = tx
+                        .send(Err(io::Error::new(io::ErrorKind::Other, error)))
+                        .await;
                 }
             } else {
                 warn!(error = %error, "gateway error");
@@ -377,6 +430,31 @@ fn close_gateway_connection(connection: &GatewayConnection, reason: &str) {
     for stream_id in http_waiters {
         if let Some((_, tx)) = connection.http_waiters.remove(&stream_id) {
             let _ = tx.send(Err(reason.to_string()));
+        }
+    }
+
+    let http_head_waiters = connection
+        .http_head_waiters
+        .iter()
+        .map(|entry| *entry.key())
+        .collect::<Vec<_>>();
+    for stream_id in http_head_waiters {
+        if let Some((_, tx)) = connection.http_head_waiters.remove(&stream_id) {
+            let _ = tx.send(Err(reason.to_string()));
+        }
+    }
+
+    let http_body_streams = connection
+        .http_body_streams
+        .iter()
+        .map(|entry| *entry.key())
+        .collect::<Vec<_>>();
+    for stream_id in http_body_streams {
+        if let Some((_, tx)) = connection.http_body_streams.remove(&stream_id) {
+            let _ = tx.try_send(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                reason.to_string(),
+            )));
         }
     }
 

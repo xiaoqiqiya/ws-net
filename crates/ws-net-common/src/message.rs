@@ -14,6 +14,10 @@ impl DataFramePayload {
     pub fn as_slice(&self) -> &[u8] {
         &self.frame[self.payload_offset..]
     }
+
+    pub fn into_vec(self) -> Vec<u8> {
+        self.frame[self.payload_offset..].to_vec()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,10 +42,23 @@ pub struct HttpRequestPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpRequestHead {
+    pub method: String,
+    pub path_and_query: String,
+    pub headers: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HttpResponsePayload {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpResponseHead {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,9 +95,25 @@ pub enum Message {
         config: TargetConfig,
         request: HttpRequestPayload,
     },
+    HttpRequestStart {
+        stream_id: StreamId,
+        target: String,
+        config: TargetConfig,
+        request: HttpRequestHead,
+    },
+    HttpRequestEnd {
+        stream_id: StreamId,
+    },
     HttpResponse {
         stream_id: StreamId,
         response: HttpResponsePayload,
+    },
+    HttpResponseStart {
+        stream_id: StreamId,
+        response: HttpResponseHead,
+    },
+    HttpResponseEnd {
+        stream_id: StreamId,
     },
     Ping,
     Pong,

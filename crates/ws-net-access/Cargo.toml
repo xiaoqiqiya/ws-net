@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+bytes.workspace = true
 clap.workspace = true
 futures-util.workspace = true
 dashmap.workspace = true
@@ -14,6 +15,7 @@ hyper-util.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true
 tokio-rustls.workspace = true
 tokio-tungstenite.workspace = true
 tracing.workspace = true

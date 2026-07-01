@@ -2,13 +2,14 @@ use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 
 use anyhow::{anyhow, Result};
 use axum::{
-    body::{to_bytes, Body},
+    body::Body,
     extract::{Request, State},
     http::{HeaderName, HeaderValue, Response, StatusCode},
     response::IntoResponse,
     routing::any,
     Router,
 };
+use futures_util::StreamExt;
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as HyperBuilder,
@@ -19,15 +20,18 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
-    sync::oneshot,
+    sync::{mpsc, oneshot},
 };
 use tokio_rustls::TlsAcceptor;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, warn};
-use ws_net_common::{HttpRequestPayload, ListenerConfig, Message};
+use ws_net_common::{encode_data_frame, HttpRequestHead, ListenerConfig, Message};
 
 use crate::{
     app::{current_listener, AppState},
-    gateway::{ensure_gateway_ready, is_gateway_disconnected_error, next_stream_id, send_text},
+    gateway::{
+        ensure_gateway_ready, is_gateway_disconnected_error, next_stream_id, send_binary, send_text,
+    },
 };
 
 #[derive(Clone)]
@@ -169,7 +173,6 @@ async fn handle_http_request_result(
     let stream_id = next_stream_id(&connection);
     ensure_gateway_ready(&connection).await?;
     let (parts, body) = request.into_parts();
-    let body = to_bytes(body, 32 * 1024 * 1024).await?.to_vec();
     let path_and_query = parts
         .uri
         .path_and_query()
@@ -186,34 +189,45 @@ async fn handle_http_request_result(
         })
         .collect();
 
-    let request_payload = HttpRequestPayload {
+    let request_head = HttpRequestHead {
         method: parts.method.as_str().to_string(),
         path_and_query,
         headers,
-        body,
     };
 
     let target = state.listener.target_name();
     let target_config = state.listener.target_config();
-    let (response_tx, response_rx) = oneshot::channel();
-    connection.http_waiters.insert(stream_id, response_tx);
+    let (head_tx, head_rx) = oneshot::channel();
+    let (body_tx, body_rx) = mpsc::channel(64);
+    connection.http_head_waiters.insert(stream_id, head_tx);
+    connection.http_body_streams.insert(stream_id, body_tx);
 
     if let Err(err) = send_text(
         &connection,
-        &Message::HttpRequest {
+        &Message::HttpRequestStart {
             stream_id,
             target,
             config: target_config,
-            request: request_payload,
+            request: request_head,
         },
     )
     .await
     {
-        connection.http_waiters.remove(&stream_id);
+        connection.http_head_waiters.remove(&stream_id);
+        connection.http_body_streams.remove(&stream_id);
         return Err(err);
     }
 
-    let response = match response_rx.await? {
+    let mut body_stream = body.into_data_stream();
+    while let Some(chunk) = body_stream.next().await {
+        let chunk = chunk?;
+        if !chunk.is_empty() {
+            send_binary(&connection, encode_data_frame(stream_id, &chunk)).await?;
+        }
+    }
+    send_text(&connection, &Message::HttpRequestEnd { stream_id }).await?;
+
+    let response = match head_rx.await? {
         Ok(response) => response,
         Err(err) => return Err(anyhow!("gateway error {err}")),
     };
@@ -233,7 +247,8 @@ async fn handle_http_request_result(
             builder = builder.header(name, value);
         }
     }
-    Ok(builder.body(Body::from(response.body))?)
+    let body = Body::from_stream(ReceiverStream::new(body_rx));
+    Ok(builder.body(body)?)
 }
 
 fn response_headers_to_skip() -> HashSet<&'static str> {

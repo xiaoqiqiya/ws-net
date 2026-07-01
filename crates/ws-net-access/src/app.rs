@@ -1,14 +1,16 @@
+use std::io;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc,
 };
 
 use anyhow::{anyhow, Result};
+use bytes::Bytes;
 use dashmap::DashMap;
 use tokio::sync::{mpsc, oneshot, Notify, RwLock};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use ws_net_common::{
-    AccessConfig, DataFramePayload, HttpResponsePayload, ListenerConfig, StreamId,
+    AccessConfig, DataFramePayload, HttpResponseHead, HttpResponsePayload, ListenerConfig, StreamId,
 };
 
 #[derive(Clone)]
@@ -31,6 +33,9 @@ pub(crate) struct GatewayConnection {
     pub(crate) open_waiters: DashMap<StreamId, oneshot::Sender<Result<(), String>>>,
     pub(crate) http_waiters:
         DashMap<StreamId, oneshot::Sender<Result<HttpResponsePayload, String>>>,
+    pub(crate) http_head_waiters:
+        DashMap<StreamId, oneshot::Sender<Result<HttpResponseHead, String>>>,
+    pub(crate) http_body_streams: DashMap<StreamId, mpsc::Sender<Result<Bytes, io::Error>>>,
 }
 
 pub(crate) struct GatewayConnections {
@@ -126,7 +131,11 @@ impl GatewayConnectionPool {
 }
 
 fn connection_load(connection: &GatewayConnection) -> usize {
-    connection.tcp_streams.len() + connection.open_waiters.len() + connection.http_waiters.len()
+    connection.tcp_streams.len()
+        + connection.open_waiters.len()
+        + connection.http_waiters.len()
+        + connection.http_head_waiters.len()
+        + connection.http_body_streams.len()
 }
 
 pub(crate) fn default_server_url(config: &AccessConfig) -> Option<String> {
