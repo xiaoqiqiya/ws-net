@@ -195,8 +195,8 @@ async fn handle_http_request_result(
         headers,
     };
 
-    let target = state.listener.target_name();
-    let target_config = state.listener.target_config();
+    let target = listener.target_name();
+    let target_config = listener.target_config();
     let (head_tx, head_rx) = oneshot::channel();
     let (body_tx, body_rx) = mpsc::channel(64);
     connection.http_head_waiters.insert(stream_id, head_tx);
@@ -220,12 +220,43 @@ async fn handle_http_request_result(
 
     let mut body_stream = body.into_data_stream();
     while let Some(chunk) = body_stream.next().await {
-        let chunk = chunk?;
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(err) => {
+                connection.http_head_waiters.remove(&stream_id);
+                connection.http_body_streams.remove(&stream_id);
+                let _ = send_text(
+                    &connection,
+                    &Message::Close {
+                        stream_id,
+                        reason: "request_body_read_failed".to_string(),
+                    },
+                )
+                .await;
+                return Err(err.into());
+            }
+        };
         if !chunk.is_empty() {
-            send_binary(&connection, encode_data_frame(stream_id, &chunk)).await?;
+            if let Err(err) = send_binary(&connection, encode_data_frame(stream_id, &chunk)).await {
+                connection.http_head_waiters.remove(&stream_id);
+                connection.http_body_streams.remove(&stream_id);
+                let _ = send_text(
+                    &connection,
+                    &Message::Close {
+                        stream_id,
+                        reason: "request_body_send_failed".to_string(),
+                    },
+                )
+                .await;
+                return Err(err);
+            }
         }
     }
-    send_text(&connection, &Message::HttpRequestEnd { stream_id }).await?;
+    if let Err(err) = send_text(&connection, &Message::HttpRequestEnd { stream_id }).await {
+        connection.http_head_waiters.remove(&stream_id);
+        connection.http_body_streams.remove(&stream_id);
+        return Err(err);
+    }
 
     let response = match head_rx.await? {
         Ok(response) => response,

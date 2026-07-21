@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use dashmap::DashMap;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
+    net::{tcp::OwnedReadHalf, TcpStream},
     sync::mpsc,
 };
 use tracing::info;
@@ -65,34 +65,48 @@ async fn handle_tcp_stream_result(
     send_text(outbound, &Message::OpenOk { stream_id }).await?;
 
     let (mut tcp_read, mut tcp_write) = socket.into_split();
+    let mut target_read_closed = false;
+    let mut access_closed = false;
 
-    loop {
-        tokio::select! {
-            read = read_data_frame(&mut tcp_read, stream_id) => {
-                let frame = read?;
-                let Some(frame) = frame else {
-                    break;
-                };
-                outbound.send(axum::extract::ws::Message::Binary(frame)).await?;
+    let result: Result<()> = async {
+        loop {
+            tokio::select! {
+                read = read_data_frame(&mut tcp_read, stream_id), if !target_read_closed => {
+                    let frame = read?;
+                    let Some(frame) = frame else {
+                        target_read_closed = true;
+                        let _ = send_text(outbound, &Message::TcpEof { stream_id }).await;
+                        if access_closed {
+                            break;
+                        }
+                        continue;
+                    };
+                    outbound.send(axum::extract::ws::Message::Binary(frame)).await?;
+                }
+                bytes = write_rx.recv() => {
+                    let Some(bytes) = bytes else {
+                        info!(stream_id, target = %target_name, "tcp stream access side closed");
+                        access_closed = true;
+                        tcp_write.shutdown().await?;
+                        if target_read_closed {
+                            break;
+                        }
+                        continue;
+                    };
+                    tcp_write.write_all(bytes.as_slice()).await?;
+                }
+                else => break,
             }
-            bytes = write_rx.recv() => {
-                let Some(bytes) = bytes else {
-                    info!(stream_id, target = %target_name, "tcp stream access side closed");
-                    break;
-                };
-                tcp_write.write_all(bytes.as_slice()).await?;
-            }
-            else => break,
         }
-    }
 
-    Ok(())
+        Ok(())
+    }
+    .await;
+
+    result
 }
 
-async fn read_data_frame<R>(reader: &mut R, stream_id: u64) -> Result<Option<Vec<u8>>>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
+async fn read_data_frame(reader: &mut OwnedReadHalf, stream_id: u64) -> Result<Option<Vec<u8>>> {
     let mut frame = new_data_frame_buffer(stream_id, TCP_BUFFER_SIZE);
     let n = reader.read(&mut frame[8..]).await?;
     if n == 0 {

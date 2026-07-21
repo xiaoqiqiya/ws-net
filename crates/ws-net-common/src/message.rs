@@ -84,6 +84,9 @@ pub enum Message {
         stream_id: StreamId,
         reason: String,
     },
+    TcpEof {
+        stream_id: StreamId,
+    },
     Error {
         stream_id: Option<StreamId>,
         code: String,

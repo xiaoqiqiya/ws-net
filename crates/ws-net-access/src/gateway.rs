@@ -188,13 +188,14 @@ async fn handle_gateway_frame(connection: &GatewayConnection, frame: WsMessage) 
             Err(err) => warn!(error = %err, "failed to decode gateway text message"),
         },
         WsMessage::Binary(bytes) => {
+            let frame_len = bytes.len();
             if let Some((stream_id, payload)) = decode_data_frame_owned(bytes) {
                 if let Some(tx) = connection
                     .http_body_streams
                     .get(&stream_id)
                     .map(|entry| entry.value().clone())
                 {
-                    if tx.try_send(Ok(Bytes::from(payload.into_vec()))).is_err() {
+                    if tx.send(Ok(Bytes::from(payload.into_vec()))).await.is_err() {
                         connection.http_body_streams.remove(&stream_id);
                         let _ = send_text(
                             connection,
@@ -213,7 +214,7 @@ async fn handle_gateway_frame(connection: &GatewayConnection, frame: WsMessage) 
                     .get(&stream_id)
                     .map(|entry| entry.value().clone())
                 {
-                    if tx.try_send(payload).is_err() {
+                    if tx.send(payload).await.is_err() {
                         connection.tcp_streams.remove(&stream_id);
                         let _ = send_text(
                             connection,
@@ -224,7 +225,14 @@ async fn handle_gateway_frame(connection: &GatewayConnection, frame: WsMessage) 
                         )
                         .await;
                     }
+                } else {
+                    warn!(stream_id, "received binary frame for unknown stream");
                 }
+            } else {
+                warn!(
+                    len = frame_len,
+                    "received invalid binary frame from gateway"
+                );
             }
         }
         WsMessage::Ping(payload) => {
@@ -283,6 +291,9 @@ async fn handle_gateway_message(connection: &GatewayConnection, message: Message
             if let Some((_, tx)) = connection.http_waiters.remove(&stream_id) {
                 let _ = tx.send(Err("stream closed".to_string()));
             }
+        }
+        Message::TcpEof { stream_id } => {
+            connection.tcp_streams.remove(&stream_id);
         }
         Message::Error {
             stream_id,

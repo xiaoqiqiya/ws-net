@@ -109,9 +109,10 @@ async fn handle_socket_result(socket: axum::extract::ws::WebSocket, state: AppSt
                         handle_text_message(&state, &outbound, &streams, &http_bodies, &text).await?;
                     }
                     axum::extract::ws::Message::Binary(bytes) => {
+                        let frame_len = bytes.len();
                         if let Some((stream_id, payload)) = decode_data_frame_owned(bytes) {
                             if let Some(tx) = http_bodies.get(&stream_id).map(|entry| entry.value().clone()) {
-                                if tx.try_send(Ok(bytes::Bytes::from(payload.into_vec()))).is_err() {
+                                if tx.send(Ok(bytes::Bytes::from(payload.into_vec()))).await.is_err() {
                                     http_bodies.remove(&stream_id);
                                     let _ = send_error(&outbound, Some(stream_id), "HTTP_BODY_BACKPRESSURE", "request body channel is full").await;
                                 }
@@ -121,7 +122,7 @@ async fn handle_socket_result(socket: axum::extract::ws::WebSocket, state: AppSt
                             if let Some(tx) =
                                 streams.get(&stream_id).map(|entry| entry.value().clone())
                             {
-                                if tx.try_send(payload).is_err() {
+                                if tx.send(payload).await.is_err() {
                                     streams.remove(&stream_id);
                                     let _ = send_text(
                                         &outbound,
@@ -132,7 +133,11 @@ async fn handle_socket_result(socket: axum::extract::ws::WebSocket, state: AppSt
                                     )
                                     .await;
                                 }
+                            } else {
+                                warn!(stream_id, "received binary frame for unknown stream");
                             }
+                        } else {
+                            warn!(len = frame_len, "received invalid binary frame from access");
                         }
                     }
                     axum::extract::ws::Message::Ping(payload) => {
@@ -366,6 +371,9 @@ async fn handle_text_message(
         Message::Close { stream_id, .. } => {
             streams.remove(&stream_id);
             http_bodies.remove(&stream_id);
+        }
+        Message::TcpEof { stream_id } => {
+            streams.remove(&stream_id);
         }
         Message::Ping => {
             send_text(outbound, &Message::Pong).await?;
