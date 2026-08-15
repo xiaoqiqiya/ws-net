@@ -68,6 +68,45 @@ cargo build --release -p ws-net-gateway
 cargo build --release -p ws-net-access
 ```
 
+## Docker 镜像
+
+GitHub Actions 会额外使用 [docker/scratch.Dockerfile](docker/scratch.Dockerfile) 打包两个 `scratch` 基础镜像。非 PR 构建会推送到 GitHub Container Registry，并同时把镜像保存为 workflow artifact / tag release 附件：
+
+- `ghcr.io/xiaoqiqiya/ws-net-access:<tag-or-sha>`
+- `ghcr.io/xiaoqiqiya/ws-net-gateway:<tag-or-sha>`
+
+镜像内入口固定为 `/bin/app`，默认读取 `/config.toml`：
+
+```bash
+docker pull ghcr.io/xiaoqiqiya/ws-net-gateway:v1.0.0
+docker run --rm -v $PWD/gateway.toml:/config.toml:ro ghcr.io/xiaoqiqiya/ws-net-gateway:v1.0.0
+```
+
+也可以从 release 附件下载 tar 后手动加载：
+
+```bash
+docker load -i ws-net-gateway-v1.0.0.tar
+```
+
+本地手动构建镜像时，需要先构建 Linux musl 静态制品，再把二进制和配置文件放入 Docker 构建上下文：
+
+```bash
+sudo apt-get install -y musl-tools
+rustup target add x86_64-unknown-linux-musl
+cargo build --workspace --release --target x86_64-unknown-linux-musl
+
+mkdir -p docker-context/access docker-context/gateway
+cp target/x86_64-unknown-linux-musl/release/ws-net-access docker-context/access/app
+cp access.example.toml docker-context/access/config.toml
+cp docker/scratch.Dockerfile docker-context/access/Dockerfile
+cp target/x86_64-unknown-linux-musl/release/ws-net-gateway docker-context/gateway/app
+cp gateway.example.toml docker-context/gateway/config.toml
+cp docker/scratch.Dockerfile docker-context/gateway/Dockerfile
+
+docker build -t ws-net-access:local docker-context/access
+docker build -t ws-net-gateway:local docker-context/gateway
+```
+
 ## Gateway 配置
 
 示例文件：

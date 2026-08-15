@@ -13,6 +13,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   build:
@@ -34,15 +35,28 @@ jobs:
       - name: Setup toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
 
-      - name: Build
+      - name: Install musl toolchain
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup target add x86_64-unknown-linux-musl
+        shell: bash
+
+      - name: Build linux
+        if: runner.os == 'Linux'
+        run: cargo build --workspace --release --target x86_64-unknown-linux-musl
+
+      - name: Build windows
+        if: runner.os == 'Windows'
         run: cargo build --workspace --release
 
       - name: Prepare dist linux
         if: runner.os == 'Linux'
         run: |
           mkdir -p dist
-          cp target/release/ws-net-gateway dist/
-          cp target/release/ws-net-access dist/
+          cp target/x86_64-unknown-linux-musl/release/ws-net-gateway dist/
+          cp target/x86_64-unknown-linux-musl/release/ws-net-access dist/
           cp gateway.example.toml dist/
           cp access.example.toml dist/
         shell: bash
@@ -74,10 +88,93 @@ jobs:
           path: ${{ matrix.archive }}
           if-no-files-found: error
 
+  docker:
+    name: package scratch docker images
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download linux dist artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ws-net-linux
+          path: docker-source
+
+      - name: Extract linux dist artifact
+        run: |
+          mkdir -p docker-source/dist
+          tar -xzf docker-source/*.tar.gz -C docker-source/dist
+        shell: bash
+
+      - name: Resolve image tag
+        id: image
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          fi
+        shell: bash
+
+      - name: Resolve image repository
+        id: repo
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "access=ghcr.io/${owner}/ws-net-access" >> "$GITHUB_OUTPUT"
+          echo "gateway=ghcr.io/${owner}/ws-net-gateway" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare docker contexts
+        run: |
+          mkdir -p docker-context/access docker-context/gateway
+          cp docker-source/dist/ws-net-access docker-context/access/app
+          cp docker-source/dist/access.example.toml docker-context/access/config.toml
+          cp docker/scratch.Dockerfile docker-context/access/Dockerfile
+          cp docker-source/dist/ws-net-gateway docker-context/gateway/app
+          cp docker-source/dist/gateway.example.toml docker-context/gateway/config.toml
+          cp docker/scratch.Dockerfile docker-context/gateway/Dockerfile
+        shell: bash
+
+      - name: Build scratch images
+        run: |
+          docker build -t ${{ steps.repo.outputs.access }}:${{ steps.image.outputs.tag }} docker-context/access
+          docker build -t ${{ steps.repo.outputs.gateway }}:${{ steps.image.outputs.tag }} docker-context/gateway
+        shell: bash
+
+      - name: Push scratch images
+        if: github.event_name != 'pull_request'
+        run: |
+          docker push ${{ steps.repo.outputs.access }}:${{ steps.image.outputs.tag }}
+          docker push ${{ steps.repo.outputs.gateway }}:${{ steps.image.outputs.tag }}
+        shell: bash
+
+      - name: Save scratch images
+        run: |
+          mkdir -p docker-dist
+          docker save ${{ steps.repo.outputs.access }}:${{ steps.image.outputs.tag }} -o docker-dist/ws-net-access-${{ steps.image.outputs.tag }}.tar
+          docker save ${{ steps.repo.outputs.gateway }}:${{ steps.image.outputs.tag }} -o docker-dist/ws-net-gateway-${{ steps.image.outputs.tag }}.tar
+        shell: bash
+
+      - name: Upload docker image artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ws-net-docker-images
+          path: docker-dist/*.tar
+          if-no-files-found: error
+
   release:
     name: upload release assets
     if: startsWith(github.ref, 'refs/tags/')
-    needs: build
+    needs: [build, docker]
     runs-on: ubuntu-latest
     steps:
       - name: Download dist artifacts
