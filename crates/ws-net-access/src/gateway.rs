@@ -30,17 +30,21 @@ pub(crate) async fn connect_all_registered(
     let mut pools = Vec::new();
     let pool_size = config.access.gateway_pool_size.max(1);
 
-    for server_url in config.server_urls() {
+    for gateway in config.gateway_configs()? {
         let connections = (0..pool_size)
-            .map(|_| start_gateway_connection(config, server_url.clone()))
+            .map(|_| start_gateway_connection(gateway.server_url.clone(), gateway.token.clone()))
             .collect::<Vec<_>>();
-        pools.push(GatewayConnectionPool::new(server_url, connections)?);
+        pools.push(GatewayConnectionPool::new(
+            gateway.name,
+            gateway.server_url,
+            connections,
+        )?);
     }
 
     Ok(Arc::new(GatewayConnections::new(pools)?))
 }
 
-fn start_gateway_connection(config: &AccessConfig, server_url: String) -> Arc<GatewayConnection> {
+fn start_gateway_connection(server_url: String, token: String) -> Arc<GatewayConnection> {
     let (outbound, outbound_rx) = mpsc::channel::<WsMessage>(1024);
     let connection = Arc::new(GatewayConnection {
         server_url,
@@ -60,7 +64,7 @@ fn start_gateway_connection(config: &AccessConfig, server_url: String) -> Arc<Ga
 
     tokio::spawn(run_gateway_connection(
         connection.clone(),
-        config.access.token.clone(),
+        token,
         outbound_rx,
     ));
 

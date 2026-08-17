@@ -43,6 +43,7 @@ pub(crate) struct GatewayConnections {
 }
 
 pub(crate) struct GatewayConnectionPool {
+    pub(crate) gateway_name: String,
     pub(crate) server_url: String,
     pub(crate) connections: Vec<Arc<GatewayConnection>>,
     next: AtomicUsize,
@@ -62,15 +63,40 @@ impl GatewayConnections {
         listener: &ListenerConfig,
         default_server_url: Option<&str>,
     ) -> Result<Arc<GatewayConnection>> {
-        let server_url = listener
+        let gateway_name = listener
+            .gateway
+            .as_deref()
+            .map(str::trim)
+            .filter(|gateway_name| !gateway_name.is_empty());
+        let listener_server_url = listener
             .server_url
             .as_deref()
             .map(str::trim)
-            .filter(|server_url| !server_url.is_empty())
-            .or(default_server_url);
+            .filter(|server_url| !server_url.is_empty());
 
-        match (server_url, self.pools.as_slice()) {
-            (Some(server_url), _) => self
+        if gateway_name.is_some() && listener_server_url.is_some() {
+            return Err(anyhow!(
+                "listener '{}' must not set both gateway and server_url",
+                listener.name
+            ));
+        }
+
+        let server_url = listener_server_url.or(default_server_url);
+
+        match (gateway_name, server_url, self.pools.as_slice()) {
+            (Some(gateway_name), _, _) => self
+                .pools
+                .iter()
+                .find(|pool| pool.gateway_name == gateway_name)
+                .map(GatewayConnectionPool::next_connection)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "listener '{}' references unavailable gateway '{}'",
+                        listener.name,
+                        gateway_name
+                    )
+                }),
+            (None, Some(server_url), _) => self
                 .pools
                 .iter()
                 .find(|pool| pool.server_url == server_url)
@@ -82,14 +108,18 @@ impl GatewayConnections {
                         server_url
                     )
                 }),
-            (None, [pool]) => Ok(pool.next_connection()),
-            (None, _) => Err(anyhow!("listener '{}' must set server_url", listener.name)),
+            (None, None, [pool]) => Ok(pool.next_connection()),
+            (None, None, _) => Err(anyhow!(
+                "listener '{}' must set gateway or server_url",
+                listener.name
+            )),
         }
     }
 }
 
 impl GatewayConnectionPool {
     pub(crate) fn new(
+        gateway_name: String,
         server_url: String,
         connections: Vec<Arc<GatewayConnection>>,
     ) -> Result<Self> {
@@ -98,6 +128,7 @@ impl GatewayConnectionPool {
         }
 
         Ok(Self {
+            gateway_name,
             server_url,
             connections,
             next: AtomicUsize::new(0),
@@ -139,7 +170,14 @@ fn connection_load(connection: &GatewayConnection) -> usize {
 }
 
 pub(crate) fn default_server_url(config: &AccessConfig) -> Option<String> {
-    config
+    if !config.gateways.is_empty() {
+        return match config.gateways.as_slice() {
+            [gateway] => Some(gateway.server_url.trim().to_string()),
+            _ => None,
+        };
+    }
+
+    let legacy_default = config
         .access
         .server_url
         .as_deref()
@@ -150,7 +188,15 @@ pub(crate) fn default_server_url(config: &AccessConfig) -> Option<String> {
             } else {
                 Some(url.to_string())
             }
-        })
+        });
+
+    legacy_default.or_else(|| {
+        let gateways = config.gateway_configs().ok()?;
+        match gateways.as_slice() {
+            [gateway] => Some(gateway.server_url.clone()),
+            _ => None,
+        }
+    })
 }
 
 pub(crate) async fn current_listener(

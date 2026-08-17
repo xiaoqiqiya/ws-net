@@ -20,6 +20,7 @@ ws-net-gateway 公网入口
 ## 功能特性
 
 - 公网侧只需要开放一个端口。
+- 单个 access 进程可以连接多个 gateway，并为每个 gateway 配置独立 token。
 - access 侧支持多个本地自定义监听端口。
 - 每个 listener 内直接配置对应的内网目标，配置简单直观。
 - 支持 TCP 透明转发，适合 MySQL、Redis、SSH、PostgreSQL 等服务。
@@ -158,12 +159,22 @@ access.example.toml
 
 ```toml
 [access]
-token = "change-access-token"
+gateway_pool_size = 8
+
+[[gateways]]
+name = "primary"
 server_url = "ws://127.0.0.1:8443/tunnel"
+token = "change-primary-access-token"
+
+[[gateways]]
+name = "secondary"
+server_url = "ws://127.0.0.1:8444/tunnel"
+token = "change-secondary-access-token"
 
 [[listeners]]
 name = "mysql"
 mode = "tcp"
+gateway = "primary"
 listen = "127.0.0.1:3308"
 host = "10.0.0.10"
 port = 3306
@@ -171,6 +182,7 @@ port = 3306
 [[listeners]]
 name = "redis"
 mode = "tcp"
+gateway = "secondary"
 listen = "127.0.0.1:63790"
 host = "10.0.0.11"
 port = 6379
@@ -178,6 +190,7 @@ port = 6379
 [[listeners]]
 name = "admin"
 mode = "http"
+gateway = "primary"
 listen = "127.0.0.1:18080"
 scheme = "https"
 host = "admin.internal.local"
@@ -190,16 +203,46 @@ rewrite_cookie = true
 
 | 字段 | 说明 |
 |---|---|
-| `access.token` | 连接 gateway 使用的 token，需要和 gateway 配置一致。 |
-| `access.server_url` | gateway 的 WebSocket 地址。 |
+| `access.gateway_pool_size` | 为每个 gateway 建立的 WebSocket 长连接数量，默认值为 `8`。 |
+| `gateways[].name` | gateway 的唯一名称，供 listener 引用。 |
+| `gateways[].server_url` | gateway 的 WebSocket 地址。 |
+| `gateways[].token` | 连接该 gateway 使用的独立 token，需要和对应 gateway 配置一致。 |
 | `listeners[].name` | listener 名称，用于日志和 stream 标识。 |
 | `listeners[].mode` | 转发模式，支持 `tcp` 和 `http`。 |
+| `listeners[].gateway` | 当前 listener 使用的 gateway 名称。配置多个 gateway 时必须指定。 |
 | `listeners[].listen` | access 本地监听地址和端口。 |
 | `listeners[].host` | 内网目标服务地址。 |
 | `listeners[].port` | 内网目标服务端口。 |
 | `listeners[].scheme` | HTTP 模式下目标协议，通常是 `http` 或 `https`。TCP 模式不需要。 |
 | `listeners[].rewrite_location` | HTTP 模式下是否重写 `Location` 响应头。 |
 | `listeners[].rewrite_cookie` | HTTP 模式下是否重写 `Set-Cookie` 响应头。 |
+
+每个 gateway 的 `name` 必须唯一，`server_url` 和 `token` 不能为空。一个 listener
+不能同时配置 `gateway` 和旧字段 `server_url`。只配置一个 gateway 时，listener 可以
+省略 `gateway`；配置多个 gateway 时，必须通过 `gateway` 明确选择。
+
+旧版单 token 配置仍然兼容：
+
+```toml
+[access]
+token = "shared-token"
+server_url = "ws://127.0.0.1:8443/tunnel"
+gateway_pool_size = 8
+
+[[listeners]]
+name = "mysql"
+mode = "tcp"
+listen = "127.0.0.1:3308"
+host = "10.0.0.10"
+port = 3306
+```
+
+旧字段 `access.server_urls` 和 `listeners[].server_url` 也会继续使用
+`access.token`。新部署建议使用 `[[gateways]]` 和 `listeners[].gateway`，避免多个
+gateway 共用 token。
+
+access 检测到配置文件更新后，会按新的 Gateway URL 和 token 重建连接池；已有连接
+会在新配置验证成功后关闭。
 
 启动 access：
 
@@ -221,6 +264,7 @@ cargo run -p ws-net-access -- --config access.example.toml
 [[listeners]]
 name = "mysql"
 mode = "tcp"
+gateway = "primary"
 listen = "127.0.0.1:3308"
 host = "10.0.0.10"
 port = 3306
@@ -255,6 +299,7 @@ port = 3306
 [[listeners]]
 name = "admin"
 mode = "http"
+gateway = "primary"
 listen = "127.0.0.1:18080"
 scheme = "https"
 host = "admin.internal.local"
