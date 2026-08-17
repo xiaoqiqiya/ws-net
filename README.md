@@ -1,25 +1,26 @@
 # ws-net
 
-`ws-net` 是一个基于 Rust 实现的单端口 WebSocket 隧道工具，用于通过一个公网入口访问多个内网 TCP 服务或 HTTPS Web 服务。
+`ws-net` 是一个基于 Rust 实现的单端口 WebSocket 隧道工具。一个 `ws-net-access`
+客户端可以同时连接一个或多个公网 gateway，通过不同 gateway 访问分布在不同网络中的
+TCP 服务或 HTTP/HTTPS Web 服务。
 
 当前架构包含两个端：
 
-- `ws-net-gateway`：部署在有公网入口且能访问内网服务的机器上。
-- `ws-net-access`：部署在使用者本地机器上，负责监听本地端口并连接 gateway。
+- `ws-net-gateway`：部署在有公网入口且能访问内网服务的机器上；可以按网络部署多个实例。
+- `ws-net-access`：部署在使用者本地机器上，负责监听本地端口、维护多个 gateway 连接池，
+  并按 listener 配置选择 gateway。
 
 ```text
 本地程序 / 浏览器
         ↓
 ws-net-access 本地监听端口
-        ↓ WebSocket 长连接
-ws-net-gateway 公网入口
-        ↓
-内网 TCP / HTTP / HTTPS 服务
+        ├─ listener: mysql ── WebSocket ── gateway: primary   ── 内网 A
+        └─ listener: redis ── WebSocket ── gateway: secondary ── 内网 B
 ```
 
 ## 功能特性
 
-- 公网侧只需要开放一个端口。
+- 每个 gateway 节点在公网侧只需要开放一个端口。
 - 单个 access 进程可以连接多个 gateway，并为每个 gateway 配置独立 token。
 - access 侧支持多个本地自定义监听端口。
 - 每个 listener 内直接配置对应的内网目标，配置简单直观。
@@ -217,9 +218,19 @@ rewrite_cookie = true
 | `listeners[].rewrite_location` | HTTP 模式下是否重写 `Location` 响应头。 |
 | `listeners[].rewrite_cookie` | HTTP 模式下是否重写 `Set-Cookie` 响应头。 |
 
+### 多 Gateway 路由规则
+
+- 每个 `[[gateways]]` 配置项注册一个 gateway，`name` 是客户端内部的路由名称，
+  `server_url` 和 `token` 可以分别配置。
+- 每个 `[[listeners]]` 通过 `gateway` 选择目标 gateway。这里是明确路由关系，
+  不是在多个 gateway 之间随机选择或自动故障切换。
+- 多个 listener 可以引用同一个 gateway，并共享该 gateway 的连接池。
+- `access.gateway_pool_size` 对每个 gateway 分别生效。例如配置 2 个 gateway 且
+  `gateway_pool_size = 8` 时，access 会为两个 gateway 创建共 16 个 WebSocket 连接槽位。
+- 只有一个 gateway 时可以省略 listener 的 `gateway`；配置多个 gateway 时必须明确指定。
+
 每个 gateway 的 `name` 必须唯一，`server_url` 和 `token` 不能为空。一个 listener
-不能同时配置 `gateway` 和旧字段 `server_url`。只配置一个 gateway 时，listener 可以
-省略 `gateway`；配置多个 gateway 时，必须通过 `gateway` 明确选择。
+不能同时配置 `gateway` 和旧字段 `server_url`。
 
 旧版单 token 配置仍然兼容：
 
@@ -360,13 +371,13 @@ listen = "0.0.0.0:18080"
 
 ## 运行顺序
 
-1. 在公网/内网入口机器启动 gateway：
+1. 在各公网/内网入口机器启动 gateway。每个 gateway 使用自己的监听地址和 token：
 
 ```bash
 ws-net-gateway.exe --config gateway.example.toml
 ```
 
-2. 在访问端机器启动 access：
+2. 在访问端机器启动一个 access；其配置可以同时声明上述多个 gateway：
 
 ```bash
 ws-net-access.exe --config access.example.toml
