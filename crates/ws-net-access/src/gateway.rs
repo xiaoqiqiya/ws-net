@@ -16,7 +16,7 @@ use tokio_tungstenite::{connect_async_with_config, tungstenite::Message as WsMes
 use tracing::{info, warn};
 use ws_net_common::{
     decode_data_frame_owned, decode_message, encode_message, try_merge_data_frames, AccessConfig,
-    Message, StreamId, DATA_FRAME_HEADER_LEN,
+    Message, StreamId, TunnelCipher, TunnelFrameKind, DATA_FRAME_HEADER_LEN,
 };
 
 use crate::app::{GatewayConnection, GatewayConnectionPool, GatewayConnections};
@@ -119,24 +119,31 @@ async fn run_gateway_session(
     let server_url = connection.server_url.clone();
     let (ws, _) = connect_async_with_config(server_url.as_str(), None, true).await?;
     let (mut ws_sender, mut ws_receiver) = ws.split();
+    let bootstrap_cipher = TunnelCipher::from_shared_key(token)?;
+    let ephemeral_key_pair = ws_net_common::EphemeralKeyPair::generate()?;
 
     ws_sender
-        .send(WsMessage::Text(encode_message(&Message::RegisterAccess {
-            token: token.to_string(),
-        })?))
+        .send(encrypt_access_message(
+            &bootstrap_cipher,
+            WsMessage::Text(encode_message(&Message::RegisterAccess {
+                token: token.to_string(),
+                client_public_key: ephemeral_key_pair.public_key().to_vec(),
+            })?),
+        )?)
         .await?;
 
     let Some(frame) = ws_receiver.next().await else {
         return Err(anyhow!("gateway closed before RegisterOk"));
     };
 
-    match decode_ws_message(frame?)? {
-        Message::RegisterOk => {}
+    let gateway_public_key = match decode_gateway_message(&bootstrap_cipher, frame?)? {
+        Message::RegisterOk { gateway_public_key } => gateway_public_key,
         Message::Error { code, message, .. } => {
             return Err(anyhow!("gateway error {code}: {message}"))
         }
         other => return Err(anyhow!("unexpected register response: {other:?}")),
-    }
+    };
+    let cipher = Arc::new(ephemeral_key_pair.derive_session_cipher(&gateway_public_key)?);
 
     connection.closed.store(false, Ordering::Release);
     connection.connected.notify_waiters();
@@ -190,7 +197,7 @@ async fn run_gateway_session(
             let flush_started = Instant::now();
             for message in batch {
                 ws_sender
-                    .feed(message)
+                    .feed(encrypt_access_message(&cipher, message)?)
                     .await
                     .context("gateway websocket feed failed")?;
             }
@@ -232,11 +239,9 @@ async fn run_gateway_session(
                     return Err(anyhow!("gateway websocket read idle timeout"));
                 }
 
-                connection
-                    .outbound
-                    .send(WsMessage::Ping(Vec::new()))
+                send_text(connection, &Message::Ping)
                     .await
-                    .context("gateway websocket heartbeat failed")?;
+                    .context("gateway encrypted heartbeat failed")?;
             }
             frame = ws_receiver.next() => {
                 let Some(frame) = frame else {
@@ -245,7 +250,7 @@ async fn run_gateway_session(
 
                 let frame = frame.context("gateway websocket read failed")?;
                 last_received = Instant::now();
-                handle_gateway_frame(connection, frame).await;
+                handle_gateway_frame(connection, &cipher, frame).await;
             }
         }
     }
@@ -292,68 +297,98 @@ fn push_ws_message(
     Ok(stop_batch)
 }
 
-async fn handle_gateway_frame(connection: &GatewayConnection, frame: WsMessage) {
+async fn handle_gateway_frame(
+    connection: &GatewayConnection,
+    cipher: &TunnelCipher,
+    frame: WsMessage,
+) {
     match frame {
-        WsMessage::Text(text) => match decode_message(&text) {
-            Ok(message) => handle_gateway_message(connection, message).await,
-            Err(err) => warn!(error = %err, "failed to decode gateway text message"),
-        },
-        WsMessage::Binary(bytes) => {
-            let frame_len = bytes.len();
-            if let Some((stream_id, payload)) = decode_data_frame_owned(bytes) {
-                if let Some(tx) = connection
-                    .http_body_streams
-                    .get(&stream_id)
-                    .map(|entry| entry.value().clone())
-                {
-                    if tx.send(Ok(Bytes::from(payload.into_vec()))).await.is_err() {
-                        connection.http_body_streams.remove(&stream_id);
-                        let _ = send_text(
-                            connection,
-                            &Message::Close {
-                                stream_id,
-                                reason: "local_backpressure".to_string(),
-                            },
-                        )
-                        .await;
+        WsMessage::Ping(_) | WsMessage::Pong(_) => {
+            close_gateway_connection(connection, "received unencrypted websocket control frame");
+        }
+        WsMessage::Close(_) => close_gateway_connection(connection, "gateway websocket closed"),
+        frame => match decrypt_gateway_frame(cipher, frame) {
+            Ok((TunnelFrameKind::Text, bytes)) => match std::str::from_utf8(&bytes)
+                .ok()
+                .and_then(|text| decode_message(text).ok())
+            {
+                Some(message) => handle_gateway_message(connection, message).await,
+                None => warn!("failed to decode encrypted gateway text message"),
+            },
+            Ok((TunnelFrameKind::Binary, bytes)) => {
+                let frame_len = bytes.len();
+                if let Some((stream_id, payload)) = decode_data_frame_owned(bytes) {
+                    if let Some(tx) = connection
+                        .http_body_streams
+                        .get(&stream_id)
+                        .map(|entry| entry.value().clone())
+                    {
+                        if tx.send(Ok(Bytes::from(payload.into_vec()))).await.is_err() {
+                            connection.http_body_streams.remove(&stream_id);
+                            let _ = send_text(
+                                connection,
+                                &Message::Close {
+                                    stream_id,
+                                    reason: "local_backpressure".to_string(),
+                                },
+                            )
+                            .await;
+                        }
+                        return;
                     }
-                    return;
-                }
 
-                if let Some(tx) = connection
-                    .tcp_streams
-                    .get(&stream_id)
-                    .map(|entry| entry.value().clone())
-                {
-                    if tx.send(payload).await.is_err() {
-                        connection.tcp_streams.remove(&stream_id);
-                        let _ = send_text(
-                            connection,
-                            &Message::Close {
-                                stream_id,
-                                reason: "local_backpressure".to_string(),
-                            },
-                        )
-                        .await;
+                    if let Some(tx) = connection
+                        .tcp_streams
+                        .get(&stream_id)
+                        .map(|entry| entry.value().clone())
+                    {
+                        if tx.send(payload).await.is_err() {
+                            connection.tcp_streams.remove(&stream_id);
+                            let _ = send_text(
+                                connection,
+                                &Message::Close {
+                                    stream_id,
+                                    reason: "local_backpressure".to_string(),
+                                },
+                            )
+                            .await;
+                        }
+                    } else {
+                        warn!(stream_id, "received binary frame for unknown stream");
                     }
                 } else {
-                    warn!(stream_id, "received binary frame for unknown stream");
+                    warn!(
+                        len = frame_len,
+                        "received invalid binary frame from gateway"
+                    );
                 }
-            } else {
-                warn!(
-                    len = frame_len,
-                    "received invalid binary frame from gateway"
-                );
             }
-        }
-        WsMessage::Ping(payload) => {
-            let _ = connection.outbound.send(WsMessage::Pong(payload)).await;
-        }
-        WsMessage::Pong(_) => {}
-        WsMessage::Close(_) => {
-            close_gateway_connection(connection, "gateway websocket closed");
-        }
-        _ => {}
+            Err(err) => warn!(error = %err, "failed to decrypt gateway websocket frame"),
+        },
+    }
+}
+
+fn encrypt_access_message(cipher: &TunnelCipher, message: WsMessage) -> Result<WsMessage> {
+    match message {
+        WsMessage::Text(text) => Ok(WsMessage::Binary(
+            cipher.encrypt_from_access(TunnelFrameKind::Text, text.as_bytes())?,
+        )),
+        WsMessage::Binary(bytes) => Ok(WsMessage::Binary(
+            cipher.encrypt_from_access(TunnelFrameKind::Binary, &bytes)?,
+        )),
+        control => Ok(control),
+    }
+}
+
+fn decrypt_gateway_frame(
+    cipher: &TunnelCipher,
+    frame: WsMessage,
+) -> Result<(TunnelFrameKind, Vec<u8>)> {
+    match frame {
+        WsMessage::Binary(bytes) => cipher.decrypt_from_gateway(&bytes),
+        other => Err(anyhow!(
+            "unexpected unencrypted gateway websocket message: {other:?}"
+        )),
     }
 }
 
@@ -581,12 +616,12 @@ fn close_gateway_connection(connection: &GatewayConnection, reason: &str) {
     warn!(server_url = %connection.server_url, reason = %reason, "gateway connection closed");
 }
 
-fn decode_ws_message(message: WsMessage) -> Result<Message> {
-    match message {
-        WsMessage::Text(text) => Ok(decode_message(&text)?),
-        WsMessage::Binary(bytes) => Ok(decode_message(std::str::from_utf8(&bytes)?)?),
-        other => Err(anyhow!("unexpected websocket message: {other:?}")),
+fn decode_gateway_message(cipher: &TunnelCipher, message: WsMessage) -> Result<Message> {
+    let (kind, bytes) = decrypt_gateway_frame(cipher, message)?;
+    if kind != TunnelFrameKind::Text {
+        return Err(anyhow!("expected encrypted gateway text message"));
     }
+    Ok(decode_message(std::str::from_utf8(&bytes)?)?)
 }
 
 pub(crate) fn next_stream_id(connection: &GatewayConnection) -> StreamId {

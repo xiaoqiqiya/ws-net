@@ -29,6 +29,8 @@ ws-net-access 本地监听端口
 - access 和 gateway 之间使用长期 WebSocket 连接。
 - TCP 数据使用 WebSocket Binary frame 传输，避免 JSON 编码二进制数据带来的性能开销。
 - 多个请求通过 `stream_id` 在同一条 WebSocket 连接中复用。
+- 所有隧道认证、控制、心跳和业务帧均使用 ChaCha20-Poly1305 内层认证加密。
+- 每条 access-gateway WebSocket 连接自动通过 X25519 协商独立临时会话密钥；断线重连会自动生成新密钥。
 
 ## 项目结构
 
@@ -135,6 +137,17 @@ access_token = "change-access-token"
 | `gateway.listen` | gateway 监听地址。公网机器上开放这个端口。 |
 | `gateway.path` | WebSocket 路径。 |
 | `auth.access_token` | access 连接 gateway 时使用的认证 token。 |
+
+## 隧道内层加密
+
+`access_token` 是 access 与 gateway 唯一需要共同持有的长期秘密。它不会以明文出现在 WebSocket 隧道中：两端首先使用由 token 派生的 ChaCha20-Poly1305 握手加密器，保护注册认证和 X25519 临时公钥交换；随后各自从 X25519 共享秘密派生本连接专属的 ChaCha20-Poly1305 会话密钥。
+
+后续每一个隧道协议帧均为认证密文，包括注册响应、OPEN/CLOSE、HTTP 元数据、TCP/HTTP 二进制 payload 与协议心跳。收到普通明文 WebSocket Text、Binary、Ping 或 Pong 帧会拒绝该连接。每帧都含随机 nonce 和认证 tag，因此抓包者无法读取或静默篡改内容。
+
+- token 必须是高强度随机秘密，且 access 与对应 gateway 配置必须完全一致；不要提交到 Git、日志或聊天记录。
+- 不需要配置 `tunnel_key`。每条新连接与每次重连都会自动协商新会话密钥，旧连接的临时私钥与会话密钥只保存在内存中。
+- `wss://` 仍然是生产必需项：它保护 TLS/WebSocket 升级与网络层元数据，并验证 gateway 身份；内层加密会在 TLS 于 Nginx/Caddy 终止后继续保护隧道内容。
+- WebSocket HTTP Upgrade、TLS 握手和 Close 控制帧是底层协议，不能被包装进自身的数据帧；它们不包含隧道业务 payload，在 `wss://` 下由 TLS 保护。
 
 启动 gateway：
 
@@ -421,13 +434,12 @@ cargo fmt --all && cargo check --workspace && cargo test --workspace
 当前版本是 MVP，已经支持长连接复用和二进制 TCP 数据帧，但仍有一些限制：
 
 - HTTP/HTTPS 模式目前是请求/响应整包转发，还不是响应体流式转发。
-- gateway 和 access 之间当前示例使用 `ws://`，生产环境建议使用 `wss://`。
-- token 是静态 token，后续可以升级为 HMAC timestamp/nonce 认证。
-- access 与 gateway 的长连接断开后，目前还没有自动重连逻辑。
+- gateway 和 access 之间的业务帧和认证帧都使用 ChaCha20-Poly1305 内层加密；`ws://` 下仍可防止被动窃听，生产环境仍必须使用 `wss://`。
+- `token` 只用于保护认证握手；每条 WebSocket 连接都会自动通过 X25519 协商临时会话密钥，断开即丢弃。`token` 应是强随机秘密，不要提交到 Git、日志或聊天记录。
 
 ## 生产建议
 
-- gateway 放到 Nginx/Caddy 后面，用 HTTPS/WSS 暴露。
+- gateway 放到 Nginx/Caddy 后面，用 HTTPS/WSS 暴露；即使 TLS 在代理处终止，隧道帧仍保留内层加密。
 - `access_token` 使用强随机字符串。
 - 不要把 access 的监听地址随意配置为 `0.0.0.0`。
 - 对外暴露 gateway 时，建议只开放一个 HTTPS 端口，例如 `443`。

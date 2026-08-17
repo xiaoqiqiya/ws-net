@@ -67,8 +67,11 @@ pub struct HttpResponseHead {
 pub enum Message {
     RegisterAccess {
         token: String,
+        client_public_key: Vec<u8>,
     },
-    RegisterOk,
+    RegisterOk {
+        gateway_public_key: Vec<u8>,
+    },
     Open {
         stream_id: StreamId,
         target: String,

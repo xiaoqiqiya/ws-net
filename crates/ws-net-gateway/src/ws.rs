@@ -14,8 +14,8 @@ use tokio::{
 use tracing::warn;
 use ws_net_common::{
     decode_data_frame_owned, decode_message, encode_data_frame, encode_message,
-    try_merge_data_frames, HttpRequestHead, HttpResponsePayload, Message, Mode,
-    DATA_FRAME_HEADER_LEN,
+    try_merge_data_frames, HttpRequestHead, HttpResponsePayload, Message, Mode, TunnelCipher,
+    TunnelFrameKind, DATA_FRAME_HEADER_LEN,
 };
 
 use crate::{
@@ -49,34 +49,46 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, state: AppState) {
 async fn handle_socket_result(socket: axum::extract::ws::WebSocket, state: AppState) -> Result<()> {
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
-    let Some(Ok(axum::extract::ws::Message::Text(first))) = ws_receiver.next().await else {
-        return Err(anyhow!("expected register message"));
+    let bootstrap_cipher = TunnelCipher::from_shared_key(&state.config.auth.access_token)?;
+    let Some(Ok(first)) = ws_receiver.next().await else {
+        return Err(anyhow!("expected encrypted register message"));
     };
 
-    match decode_message(&first)? {
-        Message::RegisterAccess { token } if token == state.config.auth.access_token => {}
+    let client_public_key = match decode_access_message(&bootstrap_cipher, first)? {
+        Message::RegisterAccess {
+            token,
+            client_public_key,
+        } if token == state.config.auth.access_token => client_public_key,
         Message::RegisterAccess { .. } => {
             ws_sender
-                .send(axum::extract::ws::Message::Text(encode_message(
-                    &Message::Error {
+                .send(encrypt_gateway_message(
+                    &bootstrap_cipher,
+                    axum::extract::ws::Message::Text(encode_message(&Message::Error {
                         stream_id: None,
                         code: "UNAUTHORIZED".to_string(),
                         message: "invalid access token".to_string(),
-                    },
-                )?))
+                    })?),
+                )?)
                 .await?;
             return Ok(());
         }
         _ => return Err(anyhow!("first message must be RegisterAccess")),
-    }
+    };
+    let ephemeral_key_pair = ws_net_common::EphemeralKeyPair::generate()?;
+    let gateway_public_key = ephemeral_key_pair.public_key().to_vec();
+    let cipher = Arc::new(ephemeral_key_pair.derive_session_cipher(&client_public_key)?);
 
     let (outbound, mut outbound_rx) = mpsc::channel::<axum::extract::ws::Message>(1024);
-    outbound
-        .send(axum::extract::ws::Message::Text(encode_message(
-            &Message::RegisterOk,
-        )?))
+    ws_sender
+        .send(encrypt_gateway_message(
+            &bootstrap_cipher,
+            axum::extract::ws::Message::Text(encode_message(&Message::RegisterOk {
+                gateway_public_key,
+            })?),
+        )?)
         .await?;
 
+    let writer_cipher = cipher.clone();
     let writer = tokio::spawn(async move {
         let mut pending = None;
 
@@ -121,6 +133,9 @@ async fn handle_socket_result(socket: axum::extract::ws::WebSocket, state: AppSt
             let flush_started = Instant::now();
             let mut write_failed = false;
             for message in batch {
+                let Ok(message) = encrypt_gateway_message(&writer_cipher, message) else {
+                    break;
+                };
                 if ws_sender.feed(message).await.is_err() {
                     write_failed = true;
                     break;
@@ -156,9 +171,7 @@ async fn handle_socket_result(socket: axum::extract::ws::WebSocket, state: AppSt
                     return Err(anyhow!("access websocket read idle timeout"));
                 }
 
-                outbound
-                    .send(axum::extract::ws::Message::Ping(Vec::new()))
-                    .await?;
+                send_text(&outbound, &Message::Ping).await?;
             }
             frame = ws_receiver.next() => {
                 let Some(frame) = frame else {
@@ -167,10 +180,13 @@ async fn handle_socket_result(socket: axum::extract::ws::WebSocket, state: AppSt
 
                 last_received = Instant::now();
                 match frame? {
-                    axum::extract::ws::Message::Text(text) => {
-                        handle_text_message(&state, &outbound, &streams, &http_bodies, &text).await?;
-                    }
                     axum::extract::ws::Message::Binary(bytes) => {
+                        let (kind, bytes) = cipher.decrypt_from_access(&bytes)?;
+                        if kind == TunnelFrameKind::Text {
+                            let text = std::str::from_utf8(&bytes)?;
+                            handle_text_message(&state, &outbound, &streams, &http_bodies, text).await?;
+                            continue;
+                        }
                         let frame_len = bytes.len();
                         if let Some((stream_id, payload)) = decode_data_frame_owned(bytes) {
                             if let Some(tx) = http_bodies.get(&stream_id).map(|entry| entry.value().clone()) {
@@ -202,12 +218,12 @@ async fn handle_socket_result(socket: axum::extract::ws::WebSocket, state: AppSt
                             warn!(len = frame_len, "received invalid binary frame from access");
                         }
                     }
-                    axum::extract::ws::Message::Ping(payload) => {
-                        outbound
-                            .send(axum::extract::ws::Message::Pong(payload))
-                            .await?;
+                    axum::extract::ws::Message::Text(_) => {
+                        return Err(anyhow!("received unencrypted websocket text message"));
                     }
-                    axum::extract::ws::Message::Pong(_) => {}
+                    axum::extract::ws::Message::Ping(_) | axum::extract::ws::Message::Pong(_) => {
+                        return Err(anyhow!("received unencrypted websocket control frame"));
+                    }
                     axum::extract::ws::Message::Close(_) => break,
                 }
             }
@@ -217,6 +233,35 @@ async fn handle_socket_result(socket: axum::extract::ws::WebSocket, state: AppSt
 
     writer.abort();
     Ok(())
+}
+
+fn encrypt_gateway_message(
+    cipher: &TunnelCipher,
+    message: axum::extract::ws::Message,
+) -> Result<axum::extract::ws::Message> {
+    match message {
+        axum::extract::ws::Message::Text(text) => Ok(axum::extract::ws::Message::Binary(
+            cipher.encrypt_from_gateway(TunnelFrameKind::Text, text.as_bytes())?,
+        )),
+        axum::extract::ws::Message::Binary(bytes) => Ok(axum::extract::ws::Message::Binary(
+            cipher.encrypt_from_gateway(TunnelFrameKind::Binary, &bytes)?,
+        )),
+        control => Ok(control),
+    }
+}
+
+fn decode_access_message(
+    cipher: &TunnelCipher,
+    message: axum::extract::ws::Message,
+) -> Result<Message> {
+    let axum::extract::ws::Message::Binary(bytes) = message else {
+        return Err(anyhow!("expected encrypted websocket binary message"));
+    };
+    let (kind, bytes) = cipher.decrypt_from_access(&bytes)?;
+    if kind != TunnelFrameKind::Text {
+        return Err(anyhow!("expected encrypted websocket text message"));
+    }
+    Ok(decode_message(std::str::from_utf8(&bytes)?)?)
 }
 
 fn try_merge_ws_binary(
