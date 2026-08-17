@@ -21,7 +21,7 @@ use ws_net_common::{
 use crate::{
     app::AppState,
     http_proxy::{format_error_chain, handle_http_request},
-    tcp::{handle_tcp_stream, TcpStreams},
+    tcp::{handle_tcp_stream, TcpStreamCancels, TcpStreams},
 };
 
 const ACCESS_PING_INTERVAL: Duration = Duration::from_secs(20);
@@ -158,6 +158,7 @@ async fn handle_socket_result(socket: axum::extract::ws::WebSocket, state: AppSt
     });
 
     let streams: TcpStreams = Arc::new(DashMap::new());
+    let tcp_cancels: TcpStreamCancels = Arc::new(DashMap::new());
     let http_bodies: Arc<DashMap<u64, mpsc::Sender<Result<bytes::Bytes, std::io::Error>>>> =
         Arc::new(DashMap::new());
     let mut heartbeat = interval(ACCESS_PING_INTERVAL);
@@ -177,14 +178,28 @@ async fn handle_socket_result(socket: axum::extract::ws::WebSocket, state: AppSt
                 let Some(frame) = frame else {
                     break;
                 };
+                let frame = match frame {
+                    Ok(frame) => frame,
+                    Err(err) => {
+                        warn!(error = %err, "gateway websocket read failed; ending session");
+                        break;
+                    }
+                };
 
                 last_received = Instant::now();
-                match frame? {
+                match frame {
                     axum::extract::ws::Message::Binary(bytes) => {
                         let (kind, bytes) = cipher.decrypt_from_access(&bytes)?;
                         if kind == TunnelFrameKind::Text {
                             let text = std::str::from_utf8(&bytes)?;
-                            handle_text_message(&state, &outbound, &streams, &http_bodies, text).await?;
+                            handle_text_message(
+                                &state,
+                                &outbound,
+                                &streams,
+                                &tcp_cancels,
+                                &http_bodies,
+                                text,
+                            ).await?;
                             continue;
                         }
                         let frame_len = bytes.len();
@@ -231,6 +246,16 @@ async fn handle_socket_result(socket: axum::extract::ws::WebSocket, state: AppSt
         }
     }
 
+    let canceled_streams = tcp_cancels.len();
+    tcp_cancels.clear();
+    streams.clear();
+    http_bodies.clear();
+    if canceled_streams > 0 {
+        warn!(
+            canceled_streams,
+            "gateway websocket session ended; canceled remaining tcp streams"
+        );
+    }
     writer.abort();
     Ok(())
 }
@@ -314,6 +339,7 @@ async fn handle_text_message(
     state: &AppState,
     outbound: &Outbound,
     streams: &TcpStreams,
+    tcp_cancels: &TcpStreamCancels,
     http_bodies: &Arc<DashMap<u64, mpsc::Sender<Result<bytes::Bytes, std::io::Error>>>>,
     text: &str,
 ) -> Result<()> {
@@ -333,12 +359,16 @@ async fn handle_text_message(
                 .await?;
                 return Ok(());
             }
+            let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(());
+            tcp_cancels.insert(stream_id, cancel_tx);
             tokio::spawn(handle_tcp_stream(
                 stream_id,
                 target,
                 config,
                 outbound.clone(),
                 streams.clone(),
+                tcp_cancels.clone(),
+                cancel_rx,
             ));
         }
         Message::HttpRequest {
@@ -522,6 +552,7 @@ async fn handle_text_message(
             http_bodies.remove(&stream_id);
         }
         Message::Close { stream_id, .. } => {
+            tcp_cancels.remove(&stream_id);
             streams.remove(&stream_id);
             http_bodies.remove(&stream_id);
         }

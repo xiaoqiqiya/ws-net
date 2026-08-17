@@ -5,7 +5,7 @@ use dashmap::DashMap;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{tcp::OwnedReadHalf, TcpStream},
-    sync::mpsc,
+    sync::{mpsc, watch},
     time::Instant,
 };
 use tracing::{info, warn};
@@ -20,6 +20,7 @@ const TCP_STREAM_CHANNEL_CAPACITY: usize = 64;
 const TCP_SLOW_IO: Duration = Duration::from_millis(20);
 
 pub(crate) type TcpStreams = Arc<DashMap<u64, mpsc::Sender<DataFramePayload>>>;
+pub(crate) type TcpStreamCancels = Arc<DashMap<u64, watch::Sender<()>>>;
 
 pub(crate) async fn handle_tcp_stream(
     stream_id: u64,
@@ -27,9 +28,18 @@ pub(crate) async fn handle_tcp_stream(
     target: TargetConfig,
     outbound: Outbound,
     streams: TcpStreams,
+    cancels: TcpStreamCancels,
+    cancel_rx: watch::Receiver<()>,
 ) {
-    if let Err(err) =
-        handle_tcp_stream_result(stream_id, target_name, target, &outbound, &streams).await
+    if let Err(err) = handle_tcp_stream_result(
+        stream_id,
+        target_name,
+        target,
+        &outbound,
+        &streams,
+        cancel_rx,
+    )
+    .await
     {
         let _ = send_error(
             &outbound,
@@ -40,6 +50,7 @@ pub(crate) async fn handle_tcp_stream(
         .await;
     }
     streams.remove(&stream_id);
+    cancels.remove(&stream_id);
     let _ = send_text(
         &outbound,
         &Message::Close {
@@ -56,6 +67,7 @@ async fn handle_tcp_stream_result(
     target: TargetConfig,
     outbound: &Outbound,
     streams: &TcpStreams,
+    mut cancel_rx: watch::Receiver<()>,
 ) -> Result<()> {
     let session_started = Instant::now();
     let addr = format!("{}:{}", target.host, target.port);
@@ -82,6 +94,10 @@ async fn handle_tcp_stream_result(
     let result: Result<()> = async {
         loop {
             tokio::select! {
+                _ = cancel_rx.changed() => {
+                    info!(stream_id, target = %target_name, "tcp stream canceled by access close");
+                    break;
+                }
                 read = read_data_frame(&mut tcp_read, stream_id), if !target_read_closed => {
                     let frame = read?;
                     let Some(frame) = frame else {
