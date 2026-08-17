@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
 
     let listener = TcpListener::bind(&config.gateway.listen).await?;
     info!(listen = %config.gateway.listen, path = %config.gateway.path, "gateway listening");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app).tcp_nodelay(true).await?;
     Ok(())
 }
 

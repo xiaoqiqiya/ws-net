@@ -13,8 +13,9 @@ use tokio::{
 };
 use tracing::warn;
 use ws_net_common::{
-    decode_data_frame_owned, decode_message, encode_data_frame, encode_message, HttpRequestHead,
-    HttpResponsePayload, Message, Mode,
+    decode_data_frame_owned, decode_message, encode_data_frame, encode_message,
+    try_merge_data_frames, HttpRequestHead, HttpResponsePayload, Message, Mode,
+    DATA_FRAME_HEADER_LEN,
 };
 
 use crate::{
@@ -25,6 +26,10 @@ use crate::{
 
 const ACCESS_PING_INTERVAL: Duration = Duration::from_secs(20);
 const ACCESS_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(75);
+const WS_WRITE_BATCH_MAX_MESSAGES: usize = 64;
+const WS_WRITE_BATCH_MAX_BYTES: usize = 256 * 1024;
+const WS_DATA_FRAME_MAX_PAYLOAD: usize = 64 * 1024;
+const WS_SLOW_FLUSH: Duration = Duration::from_millis(50);
 
 pub(crate) type Outbound = mpsc::Sender<axum::extract::ws::Message>;
 
@@ -73,9 +78,66 @@ async fn handle_socket_result(socket: axum::extract::ws::WebSocket, state: AppSt
         .await?;
 
     let writer = tokio::spawn(async move {
-        while let Some(message) = outbound_rx.recv().await {
-            if ws_sender.send(message).await.is_err() {
+        let mut pending = None;
+
+        loop {
+            let first = match pending.take() {
+                Some(message) => message,
+                None => {
+                    let Some(message) = outbound_rx.recv().await else {
+                        break;
+                    };
+                    message
+                }
+            };
+            let first_is_binary = matches!(&first, axum::extract::ws::Message::Binary(_));
+            let mut batch = Vec::with_capacity(WS_WRITE_BATCH_MAX_MESSAGES);
+            let mut batch_bytes = ws_message_size(&first);
+            batch.push(first);
+
+            if first_is_binary {
+                tokio::task::yield_now().await;
+                while batch.len() < WS_WRITE_BATCH_MAX_MESSAGES {
+                    let next = match outbound_rx.try_recv() {
+                        Ok(message) => message,
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                    };
+                    match push_ws_message(&mut batch, &mut batch_bytes, next) {
+                        Ok(stop_batch) => {
+                            if stop_batch {
+                                break;
+                            }
+                        }
+                        Err(deferred) => {
+                            pending = Some(deferred);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            let message_count = batch.len();
+            let flush_started = Instant::now();
+            let mut write_failed = false;
+            for message in batch {
+                if ws_sender.feed(message).await.is_err() {
+                    write_failed = true;
+                    break;
+                }
+            }
+            if write_failed || ws_sender.flush().await.is_err() {
                 break;
+            }
+
+            let flush_elapsed = flush_started.elapsed();
+            if flush_elapsed >= WS_SLOW_FLUSH {
+                warn!(
+                    message_count,
+                    batch_bytes,
+                    flush_ms = flush_elapsed.as_millis(),
+                    "slow gateway websocket batch flush"
+                );
             }
         }
     });
@@ -155,6 +217,52 @@ async fn handle_socket_result(socket: axum::extract::ws::WebSocket, state: AppSt
 
     writer.abort();
     Ok(())
+}
+
+fn try_merge_ws_binary(
+    current: &mut axum::extract::ws::Message,
+    next: &axum::extract::ws::Message,
+) -> bool {
+    match (current, next) {
+        (axum::extract::ws::Message::Binary(current), axum::extract::ws::Message::Binary(next)) => {
+            try_merge_data_frames(current, next, WS_DATA_FRAME_MAX_PAYLOAD)
+        }
+        _ => false,
+    }
+}
+
+fn ws_message_size(message: &axum::extract::ws::Message) -> usize {
+    match message {
+        axum::extract::ws::Message::Text(text) => text.len(),
+        axum::extract::ws::Message::Binary(bytes)
+        | axum::extract::ws::Message::Ping(bytes)
+        | axum::extract::ws::Message::Pong(bytes) => bytes.len(),
+        axum::extract::ws::Message::Close(_) => 0,
+    }
+}
+
+fn push_ws_message(
+    batch: &mut Vec<axum::extract::ws::Message>,
+    batch_bytes: &mut usize,
+    next: axum::extract::ws::Message,
+) -> std::result::Result<bool, axum::extract::ws::Message> {
+    let next_bytes = ws_message_size(&next);
+    if batch
+        .last_mut()
+        .is_some_and(|current| try_merge_ws_binary(current, &next))
+    {
+        *batch_bytes += next_bytes.saturating_sub(DATA_FRAME_HEADER_LEN);
+        return Ok(false);
+    }
+
+    if batch_bytes.saturating_add(next_bytes) > WS_WRITE_BATCH_MAX_BYTES {
+        return Err(next);
+    }
+
+    let stop_batch = !matches!(&next, axum::extract::ws::Message::Binary(_));
+    *batch_bytes += next_bytes;
+    batch.push(next);
+    Ok(stop_batch)
 }
 
 async fn handle_text_message(
@@ -405,4 +513,83 @@ pub(crate) async fn send_error(
         },
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::extract::ws::Message as WsMessage;
+    use ws_net_common::{decode_data_frame, encode_data_frame};
+
+    use super::{push_ws_message, ws_message_size, WS_WRITE_BATCH_MAX_BYTES};
+
+    #[test]
+    fn writer_batch_merges_same_stream_and_preserves_payload_order() {
+        let first = WsMessage::Binary(encode_data_frame(11, b"abc"));
+        let mut bytes = ws_message_size(&first);
+        let mut batch = vec![first];
+
+        assert_eq!(
+            push_ws_message(
+                &mut batch,
+                &mut bytes,
+                WsMessage::Binary(encode_data_frame(11, b"def")),
+            ),
+            Ok(false)
+        );
+        assert_eq!(batch.len(), 1);
+        let WsMessage::Binary(frame) = &batch[0] else {
+            panic!("expected binary frame");
+        };
+        assert_eq!(decode_data_frame(frame), Some((11, b"abcdef".to_vec())));
+    }
+
+    #[test]
+    fn writer_batch_keeps_different_streams_separate_and_ordered() {
+        let first = WsMessage::Binary(encode_data_frame(11, b"first"));
+        let mut bytes = ws_message_size(&first);
+        let mut batch = vec![first];
+
+        assert_eq!(
+            push_ws_message(
+                &mut batch,
+                &mut bytes,
+                WsMessage::Binary(encode_data_frame(12, b"second")),
+            ),
+            Ok(false)
+        );
+        assert_eq!(batch.len(), 2);
+        let ids = batch
+            .iter()
+            .map(|message| match message {
+                WsMessage::Binary(frame) => decode_data_frame(frame).unwrap().0,
+                _ => panic!("expected binary frame"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![11, 12]);
+    }
+
+    #[test]
+    fn writer_batch_flushes_after_a_control_message() {
+        let first = WsMessage::Binary(encode_data_frame(11, b"payload"));
+        let mut bytes = ws_message_size(&first);
+        let mut batch = vec![first];
+
+        assert_eq!(
+            push_ws_message(&mut batch, &mut bytes, WsMessage::Ping(vec![1, 2, 3])),
+            Ok(true)
+        );
+        assert!(matches!(batch[1], WsMessage::Ping(_)));
+    }
+
+    #[test]
+    fn writer_batch_defers_a_message_that_would_exceed_the_batch_limit() {
+        let first = WsMessage::Binary(vec![0; WS_WRITE_BATCH_MAX_BYTES]);
+        let mut bytes = ws_message_size(&first);
+        let mut batch = vec![first];
+        let next = WsMessage::Binary(encode_data_frame(12, b"next"));
+
+        let deferred = push_ws_message(&mut batch, &mut bytes, next).unwrap_err();
+        assert_eq!(batch.len(), 1);
+        assert!(matches!(deferred, WsMessage::Binary(_)));
+    }
 }

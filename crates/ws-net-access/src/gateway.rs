@@ -12,10 +12,11 @@ use tokio::{
     sync::mpsc,
     time::{interval, sleep, timeout, Instant, MissedTickBehavior},
 };
-use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
+use tokio_tungstenite::{connect_async_with_config, tungstenite::Message as WsMessage};
 use tracing::{info, warn};
 use ws_net_common::{
-    decode_data_frame_owned, decode_message, encode_message, AccessConfig, Message, StreamId,
+    decode_data_frame_owned, decode_message, encode_message, try_merge_data_frames, AccessConfig,
+    Message, StreamId, DATA_FRAME_HEADER_LEN,
 };
 
 use crate::app::{GatewayConnection, GatewayConnectionPool, GatewayConnections};
@@ -23,6 +24,10 @@ use crate::app::{GatewayConnection, GatewayConnectionPool, GatewayConnections};
 const GATEWAY_PING_INTERVAL: Duration = Duration::from_secs(20);
 const GATEWAY_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(75);
 const GATEWAY_READY_TIMEOUT: Duration = Duration::from_secs(10);
+const WS_WRITE_BATCH_MAX_MESSAGES: usize = 64;
+const WS_WRITE_BATCH_MAX_BYTES: usize = 256 * 1024;
+const WS_DATA_FRAME_MAX_PAYLOAD: usize = 64 * 1024;
+const WS_SLOW_FLUSH: Duration = Duration::from_millis(50);
 
 pub(crate) async fn connect_all_registered(
     config: &AccessConfig,
@@ -112,7 +117,7 @@ async fn run_gateway_session(
     outbound_rx: &mut mpsc::Receiver<WsMessage>,
 ) -> Result<()> {
     let server_url = connection.server_url.clone();
-    let (ws, _) = connect_async(server_url.as_str()).await?;
+    let (ws, _) = connect_async_with_config(server_url.as_str(), None, true).await?;
     let (mut ws_sender, mut ws_receiver) = ws.split();
 
     ws_sender
@@ -141,8 +146,78 @@ async fn run_gateway_session(
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut last_received = Instant::now();
 
+    let writer = async {
+        let mut pending = None;
+
+        loop {
+            let first = match pending.take() {
+                Some(message) => message,
+                None => {
+                    let Some(message) = outbound_rx.recv().await else {
+                        return Err(anyhow!("gateway outbound channel closed"));
+                    };
+                    message
+                }
+            };
+            let first_is_binary = matches!(&first, WsMessage::Binary(_));
+            let mut batch = Vec::with_capacity(WS_WRITE_BATCH_MAX_MESSAGES);
+            let mut batch_bytes = ws_message_size(&first);
+            batch.push(first);
+
+            if first_is_binary {
+                tokio::task::yield_now().await;
+                while batch.len() < WS_WRITE_BATCH_MAX_MESSAGES {
+                    let next = match outbound_rx.try_recv() {
+                        Ok(message) => message,
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                    };
+                    match push_ws_message(&mut batch, &mut batch_bytes, next) {
+                        Ok(stop_batch) => {
+                            if stop_batch {
+                                break;
+                            }
+                        }
+                        Err(deferred) => {
+                            pending = Some(deferred);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            let message_count = batch.len();
+            let flush_started = Instant::now();
+            for message in batch {
+                ws_sender
+                    .feed(message)
+                    .await
+                    .context("gateway websocket feed failed")?;
+            }
+            ws_sender
+                .flush()
+                .await
+                .context("gateway websocket flush failed")?;
+
+            let flush_elapsed = flush_started.elapsed();
+            if flush_elapsed >= WS_SLOW_FLUSH {
+                warn!(
+                    server_url = %server_url,
+                    message_count,
+                    batch_bytes,
+                    flush_ms = flush_elapsed.as_millis(),
+                    "slow access websocket batch flush"
+                );
+            }
+        }
+    };
+    tokio::pin!(writer);
+
     loop {
         tokio::select! {
+            result = &mut writer => {
+                return result;
+            }
             _ = connection.reconnect_now.notified() => {
                 if connection.stopped.load(Ordering::Acquire) {
                     return Err(anyhow!("gateway connection stopped"));
@@ -157,20 +232,11 @@ async fn run_gateway_session(
                     return Err(anyhow!("gateway websocket read idle timeout"));
                 }
 
-                ws_sender
+                connection
+                    .outbound
                     .send(WsMessage::Ping(Vec::new()))
                     .await
                     .context("gateway websocket heartbeat failed")?;
-            }
-            message = outbound_rx.recv() => {
-                let Some(message) = message else {
-                    return Err(anyhow!("gateway outbound channel closed"));
-                };
-
-                ws_sender
-                    .send(message)
-                    .await
-                    .context("gateway websocket write failed")?;
             }
             frame = ws_receiver.next() => {
                 let Some(frame) = frame else {
@@ -183,6 +249,47 @@ async fn run_gateway_session(
             }
         }
     }
+}
+
+fn try_merge_ws_binary(current: &mut WsMessage, next: &WsMessage) -> bool {
+    match (current, next) {
+        (WsMessage::Binary(current), WsMessage::Binary(next)) => {
+            try_merge_data_frames(current, next, WS_DATA_FRAME_MAX_PAYLOAD)
+        }
+        _ => false,
+    }
+}
+
+fn ws_message_size(message: &WsMessage) -> usize {
+    match message {
+        WsMessage::Text(text) => text.len(),
+        WsMessage::Binary(bytes) | WsMessage::Ping(bytes) | WsMessage::Pong(bytes) => bytes.len(),
+        WsMessage::Close(_) | WsMessage::Frame(_) => 0,
+    }
+}
+
+fn push_ws_message(
+    batch: &mut Vec<WsMessage>,
+    batch_bytes: &mut usize,
+    next: WsMessage,
+) -> std::result::Result<bool, WsMessage> {
+    let next_bytes = ws_message_size(&next);
+    if batch
+        .last_mut()
+        .is_some_and(|current| try_merge_ws_binary(current, &next))
+    {
+        *batch_bytes += next_bytes.saturating_sub(DATA_FRAME_HEADER_LEN);
+        return Ok(false);
+    }
+
+    if batch_bytes.saturating_add(next_bytes) > WS_WRITE_BATCH_MAX_BYTES {
+        return Err(next);
+    }
+
+    let stop_batch = !matches!(&next, WsMessage::Binary(_));
+    *batch_bytes += next_bytes;
+    batch.push(next);
+    Ok(stop_batch)
 }
 
 async fn handle_gateway_frame(connection: &GatewayConnection, frame: WsMessage) {
@@ -316,9 +423,7 @@ async fn handle_gateway_message(connection: &GatewayConnection, message: Message
                     let _ = tx.send(Err(error.clone()));
                 }
                 if let Some((_, tx)) = connection.http_body_streams.remove(&stream_id) {
-                    let _ = tx
-                        .send(Err(io::Error::new(io::ErrorKind::Other, error)))
-                        .await;
+                    let _ = tx.send(Err(io::Error::other(error))).await;
                 }
             } else {
                 warn!(error = %error, "gateway error");
@@ -486,4 +591,50 @@ fn decode_ws_message(message: WsMessage) -> Result<Message> {
 
 pub(crate) fn next_stream_id(connection: &GatewayConnection) -> StreamId {
     connection.stream_ids.fetch_add(1, Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+    use ws_net_common::{decode_data_frame, encode_data_frame};
+
+    use super::{push_ws_message, ws_message_size};
+
+    #[test]
+    fn writer_batch_merges_same_stream_payloads() {
+        let first = WsMessage::Binary(encode_data_frame(21, b"left"));
+        let mut bytes = ws_message_size(&first);
+        let mut batch = vec![first];
+
+        assert!(matches!(
+            push_ws_message(
+                &mut batch,
+                &mut bytes,
+                WsMessage::Binary(encode_data_frame(21, b"right")),
+            ),
+            Ok(false)
+        ));
+        assert_eq!(batch.len(), 1);
+        let WsMessage::Binary(frame) = &batch[0] else {
+            panic!("expected binary frame");
+        };
+        assert_eq!(decode_data_frame(frame), Some((21, b"leftright".to_vec())));
+    }
+
+    #[test]
+    fn writer_batch_does_not_merge_different_streams() {
+        let first = WsMessage::Binary(encode_data_frame(21, b"left"));
+        let mut bytes = ws_message_size(&first);
+        let mut batch = vec![first];
+
+        assert!(matches!(
+            push_ws_message(
+                &mut batch,
+                &mut bytes,
+                WsMessage::Binary(encode_data_frame(22, b"right")),
+            ),
+            Ok(false)
+        ));
+        assert_eq!(batch.len(), 2);
+    }
 }
