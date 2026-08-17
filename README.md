@@ -410,7 +410,6 @@ cargo fmt --all && cargo check --workspace && cargo test --workspace
 当前版本是 MVP，已经支持长连接复用和二进制 TCP 数据帧，但仍有一些限制：
 
 - HTTP/HTTPS 模式目前是请求/响应整包转发，还不是响应体流式转发。
-- WebSocket 内网站点升级代理尚未实现。
 - gateway 和 access 之间当前示例使用 `ws://`，生产环境建议使用 `wss://`。
 - token 是静态 token，后续可以升级为 HMAC timestamp/nonce 认证。
 - access 与 gateway 的长连接断开后，目前还没有自动重连逻辑。
