@@ -65,6 +65,7 @@ fn start_gateway_connection(server_url: String, token: String) -> Arc<GatewayCon
         http_waiters: DashMap::new(),
         http_head_waiters: DashMap::new(),
         http_body_streams: DashMap::new(),
+        unknown_streams: DashMap::new(),
     });
 
     tokio::spawn(run_gateway_connection(
@@ -354,7 +355,20 @@ async fn handle_gateway_frame(
                             .await;
                         }
                     } else {
-                        warn!(stream_id, "received binary frame for unknown stream");
+                        if connection.unknown_streams.insert(stream_id, ()).is_none() {
+                            warn!(
+                                stream_id,
+                                "received binary frame for unknown stream; requesting remote close"
+                            );
+                            let _ = send_text(
+                                connection,
+                                &Message::Close {
+                                    stream_id,
+                                    reason: "unknown_stream".to_string(),
+                                },
+                            )
+                            .await;
+                        }
                     }
                 } else {
                     warn!(
@@ -565,6 +579,7 @@ fn close_gateway_connection(connection: &GatewayConnection, reason: &str) {
     request_gateway_reconnect(connection);
 
     connection.tcp_streams.clear();
+    connection.unknown_streams.clear();
 
     let open_waiters = connection
         .open_waiters

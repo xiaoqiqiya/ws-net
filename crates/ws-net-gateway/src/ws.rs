@@ -9,6 +9,7 @@ use dashmap::DashMap;
 use futures_util::{future::FutureExt, SinkExt, StreamExt};
 use tokio::{
     sync::mpsc,
+    task::AbortHandle,
     time::{interval, Instant, MissedTickBehavior},
 };
 use tracing::warn;
@@ -32,6 +33,30 @@ const WS_DATA_FRAME_MAX_PAYLOAD: usize = 64 * 1024;
 const WS_SLOW_FLUSH: Duration = Duration::from_millis(50);
 
 pub(crate) type Outbound = mpsc::Sender<axum::extract::ws::Message>;
+type HttpBodies = Arc<DashMap<u64, mpsc::Sender<Result<bytes::Bytes, std::io::Error>>>>;
+
+struct SessionCleanup {
+    writer_abort: AbortHandle,
+    streams: TcpStreams,
+    tcp_cancels: TcpStreamCancels,
+    http_bodies: HttpBodies,
+}
+
+impl Drop for SessionCleanup {
+    fn drop(&mut self) {
+        self.writer_abort.abort();
+        let canceled_streams = self.tcp_cancels.len();
+        self.tcp_cancels.clear();
+        self.streams.clear();
+        self.http_bodies.clear();
+        if canceled_streams > 0 {
+            warn!(
+                canceled_streams,
+                "gateway websocket session ended; canceled remaining tcp streams"
+            );
+        }
+    }
+}
 
 pub(crate) async fn ws_entry(
     ws: WebSocketUpgrade,
@@ -159,8 +184,13 @@ async fn handle_socket_result(socket: axum::extract::ws::WebSocket, state: AppSt
 
     let streams: TcpStreams = Arc::new(DashMap::new());
     let tcp_cancels: TcpStreamCancels = Arc::new(DashMap::new());
-    let http_bodies: Arc<DashMap<u64, mpsc::Sender<Result<bytes::Bytes, std::io::Error>>>> =
-        Arc::new(DashMap::new());
+    let http_bodies: HttpBodies = Arc::new(DashMap::new());
+    let _session_cleanup = SessionCleanup {
+        writer_abort: writer.abort_handle(),
+        streams: streams.clone(),
+        tcp_cancels: tcp_cancels.clone(),
+        http_bodies: http_bodies.clone(),
+    };
     let mut heartbeat = interval(ACCESS_PING_INTERVAL);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut last_received = Instant::now();
@@ -246,17 +276,6 @@ async fn handle_socket_result(socket: axum::extract::ws::WebSocket, state: AppSt
         }
     }
 
-    let canceled_streams = tcp_cancels.len();
-    tcp_cancels.clear();
-    streams.clear();
-    http_bodies.clear();
-    if canceled_streams > 0 {
-        warn!(
-            canceled_streams,
-            "gateway websocket session ended; canceled remaining tcp streams"
-        );
-    }
-    writer.abort();
     Ok(())
 }
 
@@ -340,7 +359,7 @@ async fn handle_text_message(
     outbound: &Outbound,
     streams: &TcpStreams,
     tcp_cancels: &TcpStreamCancels,
-    http_bodies: &Arc<DashMap<u64, mpsc::Sender<Result<bytes::Bytes, std::io::Error>>>>,
+    http_bodies: &HttpBodies,
     text: &str,
 ) -> Result<()> {
     match decode_message(text)? {

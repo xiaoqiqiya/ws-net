@@ -36,6 +36,7 @@ pub(crate) struct GatewayConnection {
     pub(crate) http_head_waiters:
         DashMap<StreamId, oneshot::Sender<Result<HttpResponseHead, String>>>,
     pub(crate) http_body_streams: DashMap<StreamId, mpsc::Sender<Result<Bytes, io::Error>>>,
+    pub(crate) unknown_streams: DashMap<StreamId, ()>,
 }
 
 pub(crate) struct GatewayConnections {
