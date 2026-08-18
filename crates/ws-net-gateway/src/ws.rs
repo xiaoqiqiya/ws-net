@@ -1,6 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use axum::{
     extract::{ws::WebSocketUpgrade, State},
     response::IntoResponse,
@@ -16,13 +16,13 @@ use tracing::warn;
 use ws_net_common::{
     decode_data_frame_owned, decode_message, encode_data_frame, encode_message,
     try_merge_data_frames, HttpRequestHead, HttpResponsePayload, Message, Mode, TunnelCipher,
-    TunnelFrameKind, DATA_FRAME_HEADER_LEN,
+    TunnelFrameKind, DATA_FRAME_HEADER_LEN, MAX_ENCRYPTED_TUNNEL_FRAME_SIZE,
 };
 
 use crate::{
     app::AppState,
     http_proxy::{format_error_chain, handle_http_request},
-    tcp::{handle_tcp_stream, TcpStreamCancels, TcpStreams},
+    tcp::{handle_tcp_stream, StreamCancellation, StreamCancels, TcpStreams},
 };
 
 const ACCESS_PING_INTERVAL: Duration = Duration::from_secs(20);
@@ -38,15 +38,18 @@ type HttpBodies = Arc<DashMap<u64, mpsc::Sender<Result<bytes::Bytes, std::io::Er
 struct SessionCleanup {
     writer_abort: AbortHandle,
     streams: TcpStreams,
-    tcp_cancels: TcpStreamCancels,
+    stream_cancels: StreamCancels,
     http_bodies: HttpBodies,
 }
 
 impl Drop for SessionCleanup {
     fn drop(&mut self) {
         self.writer_abort.abort();
-        let canceled_streams = self.tcp_cancels.len();
-        self.tcp_cancels.clear();
+        let canceled_streams = self.stream_cancels.len();
+        for cancellation in self.stream_cancels.iter() {
+            cancellation.value().cancel();
+        }
+        self.stream_cancels.clear();
         self.streams.clear();
         self.http_bodies.clear();
         if canceled_streams > 0 {
@@ -62,7 +65,9 @@ pub(crate) async fn ws_entry(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    ws.max_message_size(MAX_ENCRYPTED_TUNNEL_FRAME_SIZE)
+        .max_frame_size(MAX_ENCRYPTED_TUNNEL_FRAME_SIZE)
+        .on_upgrade(move |socket| handle_socket(socket, state))
 }
 
 async fn handle_socket(socket: axum::extract::ws::WebSocket, state: AppState) {
@@ -158,8 +163,13 @@ async fn handle_socket_result(socket: axum::extract::ws::WebSocket, state: AppSt
             let flush_started = Instant::now();
             let mut write_failed = false;
             for message in batch {
-                let Ok(message) = encrypt_gateway_message(&writer_cipher, message) else {
-                    break;
+                let message = match encrypt_gateway_message(&writer_cipher, message) {
+                    Ok(message) => message,
+                    Err(err) => {
+                        warn!(error = %err, "failed to encrypt gateway websocket message");
+                        write_failed = true;
+                        break;
+                    }
                 };
                 if ws_sender.feed(message).await.is_err() {
                     write_failed = true;
@@ -183,12 +193,12 @@ async fn handle_socket_result(socket: axum::extract::ws::WebSocket, state: AppSt
     });
 
     let streams: TcpStreams = Arc::new(DashMap::new());
-    let tcp_cancels: TcpStreamCancels = Arc::new(DashMap::new());
+    let stream_cancels: StreamCancels = Arc::new(DashMap::new());
     let http_bodies: HttpBodies = Arc::new(DashMap::new());
     let _session_cleanup = SessionCleanup {
         writer_abort: writer.abort_handle(),
         streams: streams.clone(),
-        tcp_cancels: tcp_cancels.clone(),
+        stream_cancels: stream_cancels.clone(),
         http_bodies: http_bodies.clone(),
     };
     let mut heartbeat = interval(ACCESS_PING_INTERVAL);
@@ -219,14 +229,14 @@ async fn handle_socket_result(socket: axum::extract::ws::WebSocket, state: AppSt
                 last_received = Instant::now();
                 match frame {
                     axum::extract::ws::Message::Binary(bytes) => {
-                        let (kind, bytes) = cipher.decrypt_from_access(&bytes)?;
+                        let (kind, bytes) = cipher.decrypt_from_access(bytes)?;
                         if kind == TunnelFrameKind::Text {
                             let text = std::str::from_utf8(&bytes)?;
                             handle_text_message(
                                 &state,
                                 &outbound,
                                 &streams,
-                                &tcp_cancels,
+                                &stream_cancels,
                                 &http_bodies,
                                 text,
                             ).await?;
@@ -290,7 +300,13 @@ fn encrypt_gateway_message(
         axum::extract::ws::Message::Binary(bytes) => Ok(axum::extract::ws::Message::Binary(
             cipher.encrypt_from_gateway(TunnelFrameKind::Binary, &bytes)?,
         )),
-        control => Ok(control),
+        axum::extract::ws::Message::Close(None) => Ok(axum::extract::ws::Message::Close(None)),
+        axum::extract::ws::Message::Close(Some(_)) => {
+            bail!("refusing to send a plaintext websocket close reason")
+        }
+        other => Err(anyhow!(
+            "refusing to send unencrypted websocket control message: {other:?}"
+        )),
     }
 }
 
@@ -301,7 +317,7 @@ fn decode_access_message(
     let axum::extract::ws::Message::Binary(bytes) = message else {
         return Err(anyhow!("expected encrypted websocket binary message"));
     };
-    let (kind, bytes) = cipher.decrypt_from_access(&bytes)?;
+    let (kind, bytes) = cipher.decrypt_from_access(bytes)?;
     if kind != TunnelFrameKind::Text {
         return Err(anyhow!("expected encrypted websocket text message"));
     }
@@ -358,7 +374,7 @@ async fn handle_text_message(
     state: &AppState,
     outbound: &Outbound,
     streams: &TcpStreams,
-    tcp_cancels: &TcpStreamCancels,
+    stream_cancels: &StreamCancels,
     http_bodies: &HttpBodies,
     text: &str,
 ) -> Result<()> {
@@ -378,16 +394,18 @@ async fn handle_text_message(
                 .await?;
                 return Ok(());
             }
-            let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(());
-            tcp_cancels.insert(stream_id, cancel_tx);
+            let cancellation = Arc::new(StreamCancellation::new());
+            if let Some(previous) = stream_cancels.insert(stream_id, cancellation.clone()) {
+                previous.cancel();
+            }
             tokio::spawn(handle_tcp_stream(
                 stream_id,
                 target,
                 config,
                 outbound.clone(),
                 streams.clone(),
-                tcp_cancels.clone(),
-                cancel_rx,
+                stream_cancels.clone(),
+                cancellation,
             ));
         }
         Message::HttpRequest {
@@ -408,84 +426,97 @@ async fn handle_text_message(
             }
             let state = state.clone();
             let outbound = outbound.clone();
+            let cancellation = Arc::new(StreamCancellation::new());
+            if let Some(previous) = stream_cancels.insert(stream_id, cancellation.clone()) {
+                previous.cancel();
+            }
+            let stream_cancels = stream_cancels.clone();
             tokio::spawn(async move {
-                let request_head = HttpRequestHead {
-                    method: request.method,
-                    path_and_query: request.path_and_query,
-                    headers: request.headers,
-                };
-                let (body_tx, body_rx) = mpsc::channel(1);
-                let _ = body_tx.send(Ok(bytes::Bytes::from(request.body))).await;
-                drop(body_tx);
+                let work = async {
+                    let request_head = HttpRequestHead {
+                        method: request.method,
+                        path_and_query: request.path_and_query,
+                        headers: request.headers,
+                    };
+                    let (body_tx, body_rx) = mpsc::channel(1);
+                    let _ = body_tx.send(Ok(bytes::Bytes::from(request.body))).await;
+                    drop(body_tx);
 
-                let response_head = Arc::new(tokio::sync::Mutex::new(None));
-                let response_body = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-                let result = handle_http_request(
-                    &state,
-                    &config,
-                    request_head,
-                    body_rx,
-                    {
-                        let response_head = response_head.clone();
-                        move |response| {
+                    let response_head = Arc::new(tokio::sync::Mutex::new(None));
+                    let response_body = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+                    let result = handle_http_request(
+                        &state,
+                        &config,
+                        request_head,
+                        body_rx,
+                        {
                             let response_head = response_head.clone();
-                            async move {
-                                *response_head.lock().await = Some(response);
-                                Ok(())
+                            move |response| {
+                                let response_head = response_head.clone();
+                                async move {
+                                    *response_head.lock().await = Some(response);
+                                    Ok(())
+                                }
+                                .boxed()
                             }
-                            .boxed()
-                        }
-                    },
-                    {
-                        let response_body = response_body.clone();
-                        move |chunk| {
+                        },
+                        {
                             let response_body = response_body.clone();
-                            async move {
-                                response_body.lock().await.extend_from_slice(&chunk);
-                                Ok(())
+                            move |chunk| {
+                                let response_body = response_body.clone();
+                                async move {
+                                    response_body.lock().await.extend_from_slice(&chunk);
+                                    Ok(())
+                                }
+                                .boxed()
                             }
-                            .boxed()
-                        }
-                    },
-                )
-                .await;
+                        },
+                    )
+                    .await;
 
-                match result {
-                    Ok(()) => {
-                        let Some(head) = response_head.lock().await.take() else {
+                    match result {
+                        Ok(()) => {
+                            let Some(head) = response_head.lock().await.take() else {
+                                let _ = send_error(
+                                    &outbound,
+                                    Some(stream_id),
+                                    "HTTP_TARGET_ERROR",
+                                    "target response head missing",
+                                )
+                                .await;
+                                return;
+                            };
+                            let response = HttpResponsePayload {
+                                status: head.status,
+                                headers: head.headers,
+                                body: response_body.lock().await.clone(),
+                            };
+                            let _ = send_text(
+                                &outbound,
+                                &Message::HttpResponse {
+                                    stream_id,
+                                    response,
+                                },
+                            )
+                            .await;
+                        }
+                        Err(err) => {
                             let _ = send_error(
                                 &outbound,
                                 Some(stream_id),
                                 "HTTP_TARGET_ERROR",
-                                "target response head missing",
+                                &format_error_chain(&err),
                             )
                             .await;
-                            return;
-                        };
-                        let response = HttpResponsePayload {
-                            status: head.status,
-                            headers: head.headers,
-                            body: response_body.lock().await.clone(),
-                        };
-                        let _ = send_text(
-                            &outbound,
-                            &Message::HttpResponse {
-                                stream_id,
-                                response,
-                            },
-                        )
-                        .await;
+                        }
                     }
-                    Err(err) => {
-                        let _ = send_error(
-                            &outbound,
-                            Some(stream_id),
-                            "HTTP_TARGET_ERROR",
-                            &format_error_chain(&err),
-                        )
-                        .await;
-                    }
+                };
+                tokio::select! {
+                    _ = cancellation.cancelled() => {}
+                    _ = work => {}
                 }
+                stream_cancels
+                    .remove_if(&stream_id, |_, current| Arc::ptr_eq(current, &cancellation));
             });
         }
         Message::HttpRequestStart {
@@ -510,68 +541,85 @@ async fn handle_text_message(
             let state = state.clone();
             let outbound = outbound.clone();
             let http_bodies = http_bodies.clone();
+            let cancellation = Arc::new(StreamCancellation::new());
+            if let Some(previous) = stream_cancels.insert(stream_id, cancellation.clone()) {
+                previous.cancel();
+            }
+            let stream_cancels = stream_cancels.clone();
             tokio::spawn(async move {
-                let result = handle_http_request(
-                    &state,
-                    &config,
-                    request,
-                    body_rx,
-                    {
-                        let outbound = outbound.clone();
-                        move |response| {
+                let work = async {
+                    let result = handle_http_request(
+                        &state,
+                        &config,
+                        request,
+                        body_rx,
+                        {
                             let outbound = outbound.clone();
-                            async move {
-                                send_text(
-                                    &outbound,
-                                    &Message::HttpResponseStart {
-                                        stream_id,
-                                        response,
-                                    },
-                                )
-                                .await
+                            move |response| {
+                                let outbound = outbound.clone();
+                                async move {
+                                    send_text(
+                                        &outbound,
+                                        &Message::HttpResponseStart {
+                                            stream_id,
+                                            response,
+                                        },
+                                    )
+                                    .await
+                                }
+                                .boxed()
                             }
-                            .boxed()
-                        }
-                    },
-                    {
-                        let outbound = outbound.clone();
-                        move |chunk| {
+                        },
+                        {
                             let outbound = outbound.clone();
-                            async move {
-                                outbound
-                                    .send(axum::extract::ws::Message::Binary(encode_data_frame(
-                                        stream_id, &chunk,
-                                    )))
-                                    .await?;
-                                Ok(())
+                            move |chunk| {
+                                let outbound = outbound.clone();
+                                async move {
+                                    outbound
+                                        .send(axum::extract::ws::Message::Binary(
+                                            encode_data_frame(stream_id, &chunk),
+                                        ))
+                                        .await?;
+                                    Ok(())
+                                }
+                                .boxed()
                             }
-                            .boxed()
+                        },
+                    )
+                    .await;
+                    http_bodies.remove(&stream_id);
+                    match result {
+                        Ok(()) => {
+                            let _ =
+                                send_text(&outbound, &Message::HttpResponseEnd { stream_id }).await;
                         }
-                    },
-                )
-                .await;
-                http_bodies.remove(&stream_id);
-                match result {
-                    Ok(()) => {
-                        let _ = send_text(&outbound, &Message::HttpResponseEnd { stream_id }).await;
+                        Err(err) => {
+                            let _ = send_error(
+                                &outbound,
+                                Some(stream_id),
+                                "HTTP_TARGET_ERROR",
+                                &format_error_chain(&err),
+                            )
+                            .await;
+                        }
                     }
-                    Err(err) => {
-                        let _ = send_error(
-                            &outbound,
-                            Some(stream_id),
-                            "HTTP_TARGET_ERROR",
-                            &format_error_chain(&err),
-                        )
-                        .await;
-                    }
+                };
+                tokio::select! {
+                    _ = cancellation.cancelled() => {}
+                    _ = work => {}
                 }
+                http_bodies.remove(&stream_id);
+                stream_cancels
+                    .remove_if(&stream_id, |_, current| Arc::ptr_eq(current, &cancellation));
             });
         }
         Message::HttpRequestEnd { stream_id } => {
             http_bodies.remove(&stream_id);
         }
         Message::Close { stream_id, .. } => {
-            tcp_cancels.remove(&stream_id);
+            if let Some((_, cancellation)) = stream_cancels.remove(&stream_id) {
+                cancellation.cancel();
+            }
             streams.remove(&stream_id);
             http_bodies.remove(&stream_id);
         }
@@ -581,7 +629,16 @@ async fn handle_text_message(
         Message::Ping => {
             send_text(outbound, &Message::Pong).await?;
         }
-        other => warn!(?other, "unexpected gateway message"),
+        Message::Pong => {}
+        Message::RegisterAccess { .. }
+        | Message::RegisterOk { .. }
+        | Message::OpenOk { .. }
+        | Message::Error { .. }
+        | Message::HttpResponse { .. }
+        | Message::HttpResponseStart { .. }
+        | Message::HttpResponseEnd { .. } => {
+            bail!("unexpected gateway-to-access message from access")
+        }
     }
     Ok(())
 }

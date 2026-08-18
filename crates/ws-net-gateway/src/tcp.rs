@@ -1,11 +1,18 @@
-use std::{io, sync::Arc, time::Duration};
+use std::{
+    io,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{tcp::OwnedReadHalf, TcpStream},
-    sync::{mpsc, watch},
+    sync::{mpsc, Notify},
     time::Instant,
 };
 use tracing::{info, warn};
@@ -20,7 +27,40 @@ const TCP_STREAM_CHANNEL_CAPACITY: usize = 64;
 const TCP_SLOW_IO: Duration = Duration::from_millis(20);
 
 pub(crate) type TcpStreams = Arc<DashMap<u64, mpsc::Sender<DataFramePayload>>>;
-pub(crate) type TcpStreamCancels = Arc<DashMap<u64, watch::Sender<()>>>;
+pub(crate) type StreamCancels = Arc<DashMap<u64, Arc<StreamCancellation>>>;
+
+pub(crate) struct StreamCancellation {
+    canceled: AtomicBool,
+    notify: Notify,
+}
+
+impl StreamCancellation {
+    pub(crate) fn new() -> Self {
+        Self {
+            canceled: AtomicBool::new(false),
+            notify: Notify::new(),
+        }
+    }
+
+    pub(crate) fn cancel(&self) {
+        if !self.canceled.swap(true, Ordering::AcqRel) {
+            self.notify.notify_waiters();
+        }
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        loop {
+            if self.canceled.load(Ordering::Acquire) {
+                return;
+            }
+            let notified = self.notify.notified();
+            if self.canceled.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
 
 pub(crate) async fn handle_tcp_stream(
     stream_id: u64,
@@ -28,8 +68,8 @@ pub(crate) async fn handle_tcp_stream(
     target: TargetConfig,
     outbound: Outbound,
     streams: TcpStreams,
-    cancels: TcpStreamCancels,
-    cancel_rx: watch::Receiver<()>,
+    cancels: StreamCancels,
+    cancellation: Arc<StreamCancellation>,
 ) {
     if let Err(err) = handle_tcp_stream_result(
         stream_id,
@@ -37,7 +77,7 @@ pub(crate) async fn handle_tcp_stream(
         target,
         &outbound,
         &streams,
-        cancel_rx,
+        cancellation.clone(),
     )
     .await
     {
@@ -50,7 +90,7 @@ pub(crate) async fn handle_tcp_stream(
         .await;
     }
     streams.remove(&stream_id);
-    cancels.remove(&stream_id);
+    cancels.remove_if(&stream_id, |_, current| Arc::ptr_eq(current, &cancellation));
     let _ = send_text(
         &outbound,
         &Message::Close {
@@ -67,7 +107,7 @@ async fn handle_tcp_stream_result(
     target: TargetConfig,
     outbound: &Outbound,
     streams: &TcpStreams,
-    mut cancel_rx: watch::Receiver<()>,
+    cancellation: Arc<StreamCancellation>,
 ) -> Result<()> {
     let session_started = Instant::now();
     let addr = format!("{}:{}", target.host, target.port);
@@ -94,7 +134,7 @@ async fn handle_tcp_stream_result(
     let result: Result<()> = async {
         loop {
             tokio::select! {
-                _ = cancel_rx.changed() => {
+                _ = cancellation.cancelled() => {
                     info!(stream_id, target = %target_name, "tcp stream canceled by access close");
                     break;
                 }
@@ -194,4 +234,46 @@ async fn read_data_frame(reader: &mut OwnedReadHalf, stream_id: u64) -> Result<O
 
     frame.truncate(DATA_FRAME_HEADER_LEN + payload_len);
     Ok(Some(frame))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn cancellation_is_observed_before_and_after_waiting() {
+        let already_cancelled = StreamCancellation::new();
+        already_cancelled.cancel();
+        already_cancelled.cancel();
+        timeout(Duration::from_millis(100), already_cancelled.cancelled())
+            .await
+            .expect("pre-cancelled waiter must complete");
+
+        let cancellation = Arc::new(StreamCancellation::new());
+        let waiter = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move { cancellation.cancelled().await }
+        });
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+        timeout(Duration::from_millis(100), waiter)
+            .await
+            .expect("waiting task must be notified")
+            .expect("waiting task must not panic");
+    }
+
+    #[test]
+    fn old_stream_cannot_remove_replacement_cancellation() {
+        let cancels: StreamCancels = Arc::new(DashMap::new());
+        let old = Arc::new(StreamCancellation::new());
+        let replacement = Arc::new(StreamCancellation::new());
+        cancels.insert(7, old.clone());
+        cancels.insert(7, replacement.clone());
+
+        assert!(cancels
+            .remove_if(&7, |_, current| Arc::ptr_eq(current, &old))
+            .is_none());
+        assert!(Arc::ptr_eq(cancels.get(&7).unwrap().value(), &replacement));
+    }
 }

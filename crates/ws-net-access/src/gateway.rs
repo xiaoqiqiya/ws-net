@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
@@ -12,11 +12,15 @@ use tokio::{
     sync::mpsc,
     time::{interval, sleep, timeout, Instant, MissedTickBehavior},
 };
-use tokio_tungstenite::{connect_async_with_config, tungstenite::Message as WsMessage};
+use tokio_tungstenite::{
+    connect_async_with_config,
+    tungstenite::{protocol::WebSocketConfig, Message as WsMessage},
+};
 use tracing::{info, warn};
 use ws_net_common::{
     decode_data_frame_owned, decode_message, encode_message, try_merge_data_frames, AccessConfig,
     Message, StreamId, TunnelCipher, TunnelFrameKind, DATA_FRAME_HEADER_LEN,
+    MAX_ENCRYPTED_TUNNEL_FRAME_SIZE,
 };
 
 use crate::app::{GatewayConnection, GatewayConnectionPool, GatewayConnections};
@@ -118,7 +122,12 @@ async fn run_gateway_session(
     outbound_rx: &mut mpsc::Receiver<WsMessage>,
 ) -> Result<()> {
     let server_url = connection.server_url.clone();
-    let (ws, _) = connect_async_with_config(server_url.as_str(), None, true).await?;
+    let ws_config = WebSocketConfig {
+        max_message_size: Some(MAX_ENCRYPTED_TUNNEL_FRAME_SIZE),
+        max_frame_size: Some(MAX_ENCRYPTED_TUNNEL_FRAME_SIZE),
+        ..Default::default()
+    };
+    let (ws, _) = connect_async_with_config(server_url.as_str(), Some(ws_config), true).await?;
     let (mut ws_sender, mut ws_receiver) = ws.split();
     let bootstrap_cipher = TunnelCipher::from_shared_key(token)?;
     let ephemeral_key_pair = ws_net_common::EphemeralKeyPair::generate()?;
@@ -251,7 +260,7 @@ async fn run_gateway_session(
 
                 let frame = frame.context("gateway websocket read failed")?;
                 last_received = Instant::now();
-                handle_gateway_frame(connection, &cipher, frame).await;
+                handle_gateway_frame(connection, &cipher, frame).await?;
             }
         }
     }
@@ -302,20 +311,19 @@ async fn handle_gateway_frame(
     connection: &GatewayConnection,
     cipher: &TunnelCipher,
     frame: WsMessage,
-) {
+) -> Result<()> {
     match frame {
         WsMessage::Ping(_) | WsMessage::Pong(_) => {
-            close_gateway_connection(connection, "received unencrypted websocket control frame");
+            bail!("received unencrypted websocket control frame");
         }
-        WsMessage::Close(_) => close_gateway_connection(connection, "gateway websocket closed"),
+        WsMessage::Close(_) => bail!("gateway websocket closed"),
         frame => match decrypt_gateway_frame(cipher, frame) {
-            Ok((TunnelFrameKind::Text, bytes)) => match std::str::from_utf8(&bytes)
-                .ok()
-                .and_then(|text| decode_message(text).ok())
-            {
-                Some(message) => handle_gateway_message(connection, message).await,
-                None => warn!("failed to decode encrypted gateway text message"),
-            },
+            Ok((TunnelFrameKind::Text, bytes)) => {
+                let text = std::str::from_utf8(&bytes)
+                    .context("encrypted gateway text is not valid UTF-8")?;
+                let message = decode_message(text).context("invalid encrypted gateway message")?;
+                handle_gateway_message(connection, message).await?;
+            }
             Ok((TunnelFrameKind::Binary, bytes)) => {
                 let frame_len = bytes.len();
                 if let Some((stream_id, payload)) = decode_data_frame_owned(bytes) {
@@ -335,7 +343,7 @@ async fn handle_gateway_frame(
                             )
                             .await;
                         }
-                        return;
+                        return Ok(());
                     }
 
                     if let Some(tx) = connection
@@ -371,15 +379,13 @@ async fn handle_gateway_frame(
                         }
                     }
                 } else {
-                    warn!(
-                        len = frame_len,
-                        "received invalid binary frame from gateway"
-                    );
+                    bail!("received invalid binary frame from gateway: len={frame_len}");
                 }
             }
-            Err(err) => warn!(error = %err, "failed to decrypt gateway websocket frame"),
+            Err(err) => return Err(err).context("failed to decrypt gateway websocket frame"),
         },
     }
+    Ok(())
 }
 
 fn encrypt_access_message(cipher: &TunnelCipher, message: WsMessage) -> Result<WsMessage> {
@@ -390,7 +396,13 @@ fn encrypt_access_message(cipher: &TunnelCipher, message: WsMessage) -> Result<W
         WsMessage::Binary(bytes) => Ok(WsMessage::Binary(
             cipher.encrypt_from_access(TunnelFrameKind::Binary, &bytes)?,
         )),
-        control => Ok(control),
+        WsMessage::Close(None) => Ok(WsMessage::Close(None)),
+        WsMessage::Close(Some(_)) => {
+            bail!("refusing to send a plaintext websocket close reason")
+        }
+        other => Err(anyhow!(
+            "refusing to send unencrypted websocket control message: {other:?}"
+        )),
     }
 }
 
@@ -399,14 +411,14 @@ fn decrypt_gateway_frame(
     frame: WsMessage,
 ) -> Result<(TunnelFrameKind, Vec<u8>)> {
     match frame {
-        WsMessage::Binary(bytes) => cipher.decrypt_from_gateway(&bytes),
+        WsMessage::Binary(bytes) => cipher.decrypt_from_gateway(bytes),
         other => Err(anyhow!(
             "unexpected unencrypted gateway websocket message: {other:?}"
         )),
     }
 }
 
-async fn handle_gateway_message(connection: &GatewayConnection, message: Message) {
+async fn handle_gateway_message(connection: &GatewayConnection, message: Message) -> Result<()> {
     match message {
         Message::OpenOk { stream_id } => {
             if let Some((_, tx)) = connection.open_waiters.remove(&stream_id) {
@@ -479,11 +491,19 @@ async fn handle_gateway_message(connection: &GatewayConnection, message: Message
             }
         }
         Message::Ping => {
-            let _ = send_text(connection, &Message::Pong).await;
+            send_text(connection, &Message::Pong).await?;
         }
         Message::Pong => {}
-        other => warn!(?other, "unexpected gateway message"),
+        Message::RegisterAccess { .. }
+        | Message::RegisterOk { .. }
+        | Message::Open { .. }
+        | Message::HttpRequest { .. }
+        | Message::HttpRequestStart { .. }
+        | Message::HttpRequestEnd { .. } => {
+            bail!("unexpected access-to-gateway message from gateway")
+        }
     }
+    Ok(())
 }
 
 pub(crate) async fn send_text(connection: &GatewayConnection, message: &Message) -> Result<()> {

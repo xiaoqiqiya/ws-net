@@ -31,6 +31,8 @@ ws-net-access 本地监听端口
 - 多个请求通过 `stream_id` 在同一条 WebSocket 连接中复用。
 - 所有隧道认证、控制、心跳和业务帧均使用 ChaCha20-Poly1305 内层认证加密。
 - 每条 access-gateway WebSocket 连接自动通过 X25519 协商独立临时会话密钥；断线重连会自动生成新密钥。
+- access→gateway 与 gateway→access 使用 HKDF-SHA256 派生的不同方向密钥，并校验严格递增的帧序号。
+- TCP 和 HTTP stream 在关闭或会话断开时都会主动取消，避免目标连接或请求继续滞留。
 
 ## 项目结构
 
@@ -142,12 +144,16 @@ access_token = "change-access-token"
 
 `access_token` 是 access 与 gateway 唯一需要共同持有的长期秘密。它不会以明文出现在 WebSocket 隧道中：两端首先使用由 token 派生的 ChaCha20-Poly1305 握手加密器，保护注册认证和 X25519 临时公钥交换；随后各自从 X25519 共享秘密派生本连接专属的 ChaCha20-Poly1305 会话密钥。
 
-后续每一个隧道协议帧均为认证密文，包括注册响应、OPEN/CLOSE、HTTP 元数据、TCP/HTTP 二进制 payload 与协议心跳。收到普通明文 WebSocket Text、Binary、Ping 或 Pong 帧会拒绝该连接。每帧都含随机 nonce 和认证 tag，因此抓包者无法读取或静默篡改内容。
+后续每一个隧道协议帧均为认证密文，包括注册响应、OPEN/CLOSE、HTTP 元数据、TCP/HTTP 二进制 payload 与协议心跳。收到普通明文 WebSocket Text、Binary、Ping 或 Pong 帧会拒绝并关闭该连接。每个方向使用独立密钥，nonce 由固定方向前缀和严格递增的 64 位帧序号组成；接收端只接受下一个预期序号，因此重放、重复、丢失或乱序帧都会认证失败或被拒绝。每帧同时带有 Poly1305 认证 tag，抓包者无法读取或静默篡改内容。
 
 - token 必须是高强度随机秘密，且 access 与对应 gateway 配置必须完全一致；不要提交到 Git、日志或聊天记录。
 - 不需要配置 `tunnel_key`。每条新连接与每次重连都会自动协商新会话密钥，旧连接的临时私钥与会话密钥只保存在内存中。
+- 单个加密 WebSocket 帧最大为 16 MiB；access 和 gateway 两端都会在协议入口和解密入口执行限制。
+- v2 加密帧不再为每个数据帧调用系统随机数生成器，并减少了加解密过程中的缓冲区分配和复制，以降低大文件上传时的 CPU 开销。
 - `wss://` 仍然是生产必需项：它保护 TLS/WebSocket 升级与网络层元数据，并验证 gateway 身份；内层加密会在 TLS 于 Nginx/Caddy 终止后继续保护隧道内容。
 - WebSocket HTTP Upgrade、TLS 握手和 Close 控制帧是底层协议，不能被包装进自身的数据帧；它们不包含隧道业务 payload，在 `wss://` 下由 TLS 保护。
+
+> 升级注意：当前 v2 加密帧格式与 v1.0.9 及更早版本不兼容。部署时必须同时升级 `ws-net-access` 和 `ws-net-gateway`，不要让新旧版本交叉连接。
 
 启动 gateway：
 
@@ -431,9 +437,9 @@ cargo fmt --all && cargo check --workspace && cargo test --workspace
 
 ## 当前限制
 
-当前版本是 MVP，已经支持长连接复用和二进制 TCP 数据帧，但仍有一些限制：
+当前版本已经支持长连接复用、二进制 TCP 数据帧和 HTTP 请求/响应流式转发，但仍有一些限制：
 
-- HTTP/HTTPS 模式目前是请求/响应整包转发，还不是响应体流式转发。
+- access 配置热重载会更新 gateway 连接、token 和已有 listener 使用的目标参数；新增/删除 listener，或修改 listener 的 `listen`、`mode` 时仍需重启 access 才会改变本地监听任务。
 - gateway 和 access 之间的业务帧和认证帧都使用 ChaCha20-Poly1305 内层加密；`ws://` 下仍可防止被动窃听，生产环境仍必须使用 `wss://`。
 - `token` 只用于保护认证握手；每条 WebSocket 连接都会自动通过 X25519 协商临时会话密钥，断开即丢弃。`token` 应是强随机秘密，不要提交到 Git、日志或聊天记录。
 

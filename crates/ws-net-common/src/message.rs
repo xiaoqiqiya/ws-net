@@ -80,10 +80,6 @@ pub enum Message {
     OpenOk {
         stream_id: StreamId,
     },
-    Data {
-        stream_id: StreamId,
-        bytes: Vec<u8>,
-    },
     Close {
         stream_id: StreamId,
         reason: String,
