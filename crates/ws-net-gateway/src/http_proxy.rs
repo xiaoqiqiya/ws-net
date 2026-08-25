@@ -24,12 +24,7 @@ pub(crate) async fn handle_http_request(
         scheme, target.host, target.port, request.path_and_query
     );
     let method = reqwest::Method::from_bytes(request.method.as_bytes())?;
-    let client = if target.accept_invalid_certs {
-        &state.http_insecure
-    } else {
-        &state.http
-    };
-    let mut builder = client.request(method, &url);
+    let mut builder = state.http.request(method, &url);
 
     let skip_headers = hop_by_hop_headers();
     for (name, value) in &request.headers {

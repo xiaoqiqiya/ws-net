@@ -237,6 +237,8 @@ rewrite_cookie = true
 | `listeners[].rewrite_location` | HTTP 模式下是否重写 `Location` 响应头。 |
 | `listeners[].rewrite_cookie` | HTTP 模式下是否重写 `Set-Cookie` 响应头。 |
 
+Gateway 访问所有目标 HTTPS 时统一使用宽松的 native-tls 客户端：Windows 使用 Schannel，Linux 使用内置构建的 OpenSSL，兼容现代 HTTPS 与部分仅支持旧 RSA 套件的内网设备。该客户端不校验证书可信链、有效期和主机名；TLS 传输仍然加密，但不能依靠证书确认目标身份，因此只应代理可信网络中的目标。旧配置中的 `accept_invalid_certs` 字段继续兼容，但其值不再改变 Gateway 的目标证书校验行为。
+
 ### 多 Gateway 路由规则
 
 - 每个 `[[gateways]]` 配置项注册一个 gateway，`name` 是客户端内部的路由名称，

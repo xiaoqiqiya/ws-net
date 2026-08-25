@@ -36,8 +36,6 @@ listen = "127.0.0.1:18080"
 scheme = "https"
 host = "admin.internal.local"
 port = 443
-# Set true only for internal HTTPS services with self-signed or name-mismatched certificates.
-accept_invalid_certs = false
 rewrite_location = true
 rewrite_cookie = true
 
@@ -54,6 +52,5 @@ auto_cert = true
 scheme = "https"
 host = "admin.internal.local"
 port = 443
-accept_invalid_certs = false
 rewrite_location = true
 rewrite_cookie = true

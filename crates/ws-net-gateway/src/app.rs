@@ -7,7 +7,6 @@ use ws_net_common::GatewayConfig;
 pub(crate) struct AppState {
     pub(crate) config: Arc<GatewayConfig>,
     pub(crate) http: reqwest::Client,
-    pub(crate) http_insecure: reqwest::Client,
 }
 
 impl AppState {
@@ -15,11 +14,11 @@ impl AppState {
         Ok(Self {
             config,
             http: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .build()?,
-            http_insecure: reqwest::Client::builder()
+                .use_native_tls()
+                .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
                 .danger_accept_invalid_certs(true)
+                .danger_accept_invalid_hostnames(true)
                 .build()?,
         })
     }
