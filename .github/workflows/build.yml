@@ -25,7 +25,12 @@ jobs:
         include:
           - os: ubuntu-latest
             platform: linux
+            target: x86_64-unknown-linux-musl
             archive: ws-net-linux-${{ github.ref_type == 'tag' && github.ref_name || github.sha }}.tar.gz
+          - os: ubuntu-latest
+            platform: linux-arm64
+            target: aarch64-unknown-linux-musl
+            archive: ws-net-linux-arm64-${{ github.ref_type == 'tag' && github.ref_name || github.sha }}.tar.gz
           - os: windows-latest
             platform: windows
             archive: ws-net-windows-${{ github.ref_type == 'tag' && github.ref_name || github.sha }}.zip
@@ -36,16 +41,24 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
 
       - name: Install musl toolchain
-        if: runner.os == 'Linux'
+        if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
           rustup target add x86_64-unknown-linux-musl
         shell: bash
 
-      - name: Build linux
-        if: runner.os == 'Linux'
+      - name: Install cross
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        uses: taiki-e/install-action@cross
+
+      - name: Build linux amd64
+        if: matrix.target == 'x86_64-unknown-linux-musl'
         run: cargo build --workspace --release --target x86_64-unknown-linux-musl
+
+      - name: Build linux arm64
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: cross build --workspace --release --target aarch64-unknown-linux-musl
 
       - name: Build windows
         if: runner.os == 'Windows'
@@ -55,8 +68,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           mkdir -p dist
-          cp target/x86_64-unknown-linux-musl/release/ws-net-gateway dist/
-          cp target/x86_64-unknown-linux-musl/release/ws-net-access dist/
+          cp target/${{ matrix.target }}/release/ws-net-gateway dist/
+          cp target/${{ matrix.target }}/release/ws-net-access dist/
           cp gateway.example.toml dist/
           cp access.example.toml dist/
         shell: bash
