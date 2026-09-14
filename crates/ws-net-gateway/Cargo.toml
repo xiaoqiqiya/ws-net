@@ -3,6 +3,14 @@ name = "ws-net-gateway"
 version = "0.1.0"
 edition.workspace = true
 
+[[bin]]
+name = "ws-net-gateway"
+path = "src/main.rs"
+
+[[bin]]
+name = "gateway"
+path = "src/alias.rs"
+
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
@@ -13,8 +21,22 @@ futures-util.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+toml_edit.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 ws-net-common.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tokio-tungstenite.workspace = true
+tokio-rustls.workspace = true
+rcgen.workspace = true

@@ -65,6 +65,14 @@ pub struct HttpResponseHead {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Message {
+    RegisterAccessV3 {
+        instance_id: String,
+        client_public_key: Vec<u8>,
+    },
+    RegisterOkV3 {
+        gateway_public_key: Vec<u8>,
+        user_name: String,
+    },
     RegisterAccess {
         token: String,
         client_public_key: Vec<u8>,

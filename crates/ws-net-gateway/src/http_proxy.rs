@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, net::SocketAddr};
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -11,20 +11,52 @@ use ws_net_common::{HttpRequestHead, HttpResponseHead, TargetConfig};
 use crate::app::AppState;
 
 pub(crate) async fn handle_http_request(
-    state: &AppState,
+    _state: &AppState,
     target: &TargetConfig,
+    address: Vec<SocketAddr>,
     request: HttpRequestHead,
     body_rx: mpsc::Receiver<Result<Bytes, std::io::Error>>,
     on_response_head: impl FnOnce(HttpResponseHead) -> BoxFuture<'static, Result<()>>,
     mut on_body_chunk: impl FnMut(Bytes) -> BoxFuture<'static, Result<()>>,
 ) -> Result<()> {
     let scheme = target.scheme.as_deref().unwrap_or("http");
-    let url = format!(
-        "{}://{}:{}{}",
-        scheme, target.host, target.port, request.path_and_query
-    );
+    if !matches!(scheme, "http" | "https") || !request.path_and_query.starts_with('/') {
+        anyhow::bail!("HTTP 目标协议或请求路径不合法");
+    }
+    let host = target.host.trim_start_matches('[').trim_end_matches(']');
+    let authority = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let url = reqwest::Url::parse(&format!(
+        "{scheme}://{authority}:{}{}",
+        target.port, request.path_and_query
+    ))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("HTTP 目标缺少主机"))?;
+    let literal = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>();
+    if url.port_or_known_default() != Some(target.port)
+        || literal.is_ok_and(|ip| !address.contains(&SocketAddr::new(ip, target.port)))
+    {
+        anyhow::bail!("HTTP 目标与已授权地址不一致");
+    }
+    // Pin the checked address while preserving the URL hostname for Host/SNI and header rewriting.
+    // ponytail: one client per request prevents stale DNS authorization; pool by checked addresses if throughput requires it.
+    let http = reqwest::Client::builder()
+        .use_native_tls()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_hostnames(true)
+        .resolve_to_addrs(host, &address)
+        .build()?;
     let method = reqwest::Method::from_bytes(request.method.as_bytes())?;
-    let mut builder = state.http.request(method, &url);
+    let mut builder = http.request(method, url.clone());
 
     let skip_headers = hop_by_hop_headers();
     for (name, value) in &request.headers {

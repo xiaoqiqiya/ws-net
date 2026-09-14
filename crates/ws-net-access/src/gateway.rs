@@ -18,12 +18,15 @@ use tokio_tungstenite::{
 };
 use tracing::{info, warn};
 use ws_net_common::{
-    decode_data_frame_owned, decode_message, encode_message, try_merge_data_frames, AccessConfig,
-    Message, StreamId, TunnelCipher, TunnelFrameKind, DATA_FRAME_HEADER_LEN,
-    MAX_ENCRYPTED_TUNNEL_FRAME_SIZE,
+    credential_id, decode_data_frame_owned, decode_message, encode_message, random_id,
+    try_merge_data_frames, AccessConfig, GatewayError, Message, StreamId, TunnelCipher,
+    TunnelFrameKind, CLIENT_NONCE_HEADER, CREDENTIAL_HEADER, DATA_FRAME_HEADER_LEN,
+    MAX_ENCRYPTED_TUNNEL_FRAME_SIZE, PROTOCOL_HEADER, SERVER_NONCE_HEADER,
 };
 
-use crate::app::{GatewayConnection, GatewayConnectionPool, GatewayConnections};
+use crate::app::{
+    AccessIdentity, AccessRuntime, GatewayConnection, GatewayConnectionPool, GatewayConnections,
+};
 
 const GATEWAY_PING_INTERVAL: Duration = Duration::from_secs(20);
 const GATEWAY_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(75);
@@ -35,13 +38,27 @@ const WS_SLOW_FLUSH: Duration = Duration::from_millis(50);
 
 pub(crate) async fn connect_all_registered(
     config: &AccessConfig,
+    runtime: &Arc<AccessRuntime>,
 ) -> Result<Arc<GatewayConnections>> {
     let mut pools = Vec::new();
     let pool_size = config.access.gateway_pool_size.max(1);
 
-    for gateway in config.gateway_configs()? {
+    // Validate every identity before starting any network task.
+    let gateways = config.gateway_configs()?;
+    let identities = gateways
+        .iter()
+        .map(|gateway| runtime.identity(&gateway.server_url, &gateway.token))
+        .collect::<Result<Vec<_>>>()?;
+    for (gateway, identity) in gateways.into_iter().zip(identities) {
         let connections = (0..pool_size)
-            .map(|_| start_gateway_connection(gateway.server_url.clone(), gateway.token.clone()))
+            .map(|_| {
+                start_gateway_connection(
+                    gateway.server_url.clone(),
+                    gateway.token.clone(),
+                    identity.clone(),
+                    runtime.instance_id.clone(),
+                )
+            })
             .collect::<Vec<_>>();
         pools.push(GatewayConnectionPool::new(
             gateway.name,
@@ -53,10 +70,16 @@ pub(crate) async fn connect_all_registered(
     Ok(Arc::new(GatewayConnections::new(pools)?))
 }
 
-fn start_gateway_connection(server_url: String, token: String) -> Arc<GatewayConnection> {
+fn start_gateway_connection(
+    server_url: String,
+    token: String,
+    identity: Arc<AccessIdentity>,
+    instance_id: String,
+) -> Arc<GatewayConnection> {
     let (outbound, outbound_rx) = mpsc::channel::<WsMessage>(1024);
     let connection = Arc::new(GatewayConnection {
         server_url,
+        identity: identity.clone(),
         outbound,
         closed: std::sync::atomic::AtomicBool::new(true),
         stopped: std::sync::atomic::AtomicBool::new(false),
@@ -72,9 +95,19 @@ fn start_gateway_connection(server_url: String, token: String) -> Arc<GatewayCon
         unknown_streams: DashMap::new(),
     });
 
+    {
+        let mut connections = identity
+            .connections
+            .lock()
+            .expect("identity connections poisoned");
+        connections.retain(|connection| connection.strong_count() > 0);
+        connections.push(Arc::downgrade(&connection));
+    }
+
     tokio::spawn(run_gateway_connection(
         connection.clone(),
         token,
+        instance_id,
         outbound_rx,
     ));
 
@@ -84,41 +117,87 @@ fn start_gateway_connection(server_url: String, token: String) -> Arc<GatewayCon
 async fn run_gateway_connection(
     connection: Arc<GatewayConnection>,
     token: String,
+    instance_id: String,
     mut outbound_rx: mpsc::Receiver<WsMessage>,
 ) {
     let mut retry_after = Duration::from_secs(1);
 
-    while !connection.stopped.load(Ordering::Acquire) {
-        match run_gateway_session(&connection, &token, &mut outbound_rx).await {
-            Ok(()) => warn!(server_url = %connection.server_url, "gateway websocket session ended"),
-            Err(err) => {
-                warn!(server_url = %connection.server_url, error = %err, "gateway reconnect failed")
+    while !connection.stopped.load(Ordering::Acquire) && connection.identity.error().is_none() {
+        let result = tokio::select! {
+            biased;
+            error = connection.identity.cancelled() => Err(error.into()),
+            _ = gateway_stopped(&connection) => Ok(()),
+            result = run_gateway_session(&connection, &token, &instance_id, &mut outbound_rx) => result,
+        };
+        if let Err(error) = &result {
+            if let Some(error) = error
+                .downcast_ref::<GatewayError>()
+                .filter(|error| error.terminal())
+            {
+                stop_identity(&connection, error.clone());
             }
         }
+        let reason = result
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "网关连接已关闭".into());
 
         let was_connected = !connection.closed.load(Ordering::Acquire);
-        close_gateway_connection(&connection, "gateway disconnected");
+        close_gateway_connection(&connection, &reason);
         while outbound_rx.try_recv().is_ok() {}
+        if connection.stopped.load(Ordering::Acquire) || connection.identity.error().is_some() {
+            break;
+        }
         if was_connected {
             retry_after = Duration::from_secs(1);
         }
         if !connection.reconnect_requested.swap(false, Ordering::AcqRel) {
             tokio::select! {
+                biased;
+                _ = connection.identity.cancelled() => break,
                 _ = sleep(retry_after) => {}
                 _ = connection.reconnect_now.notified() => {
                     connection.reconnect_requested.store(false, Ordering::Release);
                 }
             }
         }
+        warn!(server_url = %connection.server_url, reason = %reason, retry_seconds = retry_after.as_secs(), "网关连接中断，将按退避间隔重试");
         retry_after = (retry_after * 2).min(Duration::from_secs(30));
     }
 
-    close_gateway_connection(&connection, "gateway connection stopped");
+    close_gateway_connection(&connection, "网关连接已停止");
+}
+
+fn stop_identity(connection: &GatewayConnection, error: GatewayError) {
+    let identity = &connection.identity;
+    {
+        let mut blocked = identity.blocked.lock().expect("identity lock poisoned");
+        if blocked.is_some() {
+            return;
+        }
+        *blocked = Some(error.clone());
+    }
+    identity.changed.notify_waiters();
+    let connections: Vec<_> = identity
+        .connections
+        .lock()
+        .expect("identity connections poisoned")
+        .iter()
+        .filter_map(|connection| connection.upgrade())
+        .collect();
+    for connection in connections {
+        connection.stopped.store(true, Ordering::Release);
+        connection.reconnect_now.notify_waiters();
+        connection.connected.notify_waiters();
+        close_gateway_connection(&connection, &error.message);
+    }
+    warn!(server_url = %connection.server_url, code = %error.code, "{}", error.message);
 }
 
 async fn run_gateway_session(
     connection: &Arc<GatewayConnection>,
     token: &str,
+    instance_id: &str,
     outbound_rx: &mut mpsc::Receiver<WsMessage>,
 ) -> Result<()> {
     let server_url = connection.server_url.clone();
@@ -127,37 +206,99 @@ async fn run_gateway_session(
         max_frame_size: Some(MAX_ENCRYPTED_TUNNEL_FRAME_SIZE),
         ..Default::default()
     };
-    let (ws, _) = connect_async_with_config(server_url.as_str(), Some(ws_config), true).await?;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut request = server_url.as_str().into_client_request()?;
+    let client_nonce = random_id()?;
+    request.headers_mut().insert(PROTOCOL_HEADER, "3".parse()?);
+    request
+        .headers_mut()
+        .insert(CREDENTIAL_HEADER, credential_id(token).parse()?);
+    request
+        .headers_mut()
+        .insert(CLIENT_NONCE_HEADER, client_nonce.parse()?);
+    info!(server_url = %server_url, "正在连接网关");
+    let (ws, response) = match timeout(
+        GATEWAY_READY_TIMEOUT,
+        connect_async_with_config(request, Some(ws_config), true),
+    )
+    .await?
+    {
+        Ok(connected) => connected,
+        Err(tokio_tungstenite::tungstenite::Error::Http(response))
+            if response.status().as_u16() == 401 =>
+        {
+            return Err(GatewayError::unauthorized().into())
+        }
+        Err(error) => return Err(error.into()),
+    };
     let (mut ws_sender, mut ws_receiver) = ws.split();
-    let bootstrap_cipher = TunnelCipher::from_shared_key(token)?;
+    let server_nonce = response
+        .headers()
+        .get(SERVER_NONCE_HEADER)
+        .and_then(|value| value.to_str().ok());
+    let v3 = server_nonce.is_some();
+    let bootstrap_cipher = if let Some(server_nonce) = server_nonce {
+        TunnelCipher::from_connection_key(token, &client_nonce, server_nonce)?
+    } else {
+        TunnelCipher::from_shared_key(token)?
+    };
     let ephemeral_key_pair = ws_net_common::EphemeralKeyPair::generate()?;
 
     ws_sender
         .send(encrypt_access_message(
             &bootstrap_cipher,
-            WsMessage::Text(encode_message(&Message::RegisterAccess {
-                token: token.to_string(),
-                client_public_key: ephemeral_key_pair.public_key().to_vec(),
+            WsMessage::Text(encode_message(&if v3 {
+                Message::RegisterAccessV3 {
+                    instance_id: instance_id.to_string(),
+                    client_public_key: ephemeral_key_pair.public_key().to_vec(),
+                }
+            } else {
+                Message::RegisterAccess {
+                    token: token.to_string(),
+                    client_public_key: ephemeral_key_pair.public_key().to_vec(),
+                }
             })?),
         )?)
         .await?;
 
-    let Some(frame) = ws_receiver.next().await else {
-        return Err(anyhow!("gateway closed before RegisterOk"));
+    let Some(frame) = timeout(GATEWAY_READY_TIMEOUT, ws_receiver.next()).await? else {
+        return Err(GatewayError::network("网关在鉴权完成前关闭连接").into());
     };
 
-    let gateway_public_key = match decode_gateway_message(&bootstrap_cipher, frame?)? {
-        Message::RegisterOk { gateway_public_key } => gateway_public_key,
-        Message::Error { code, message, .. } => {
-            return Err(anyhow!("gateway error {code}: {message}"))
+    let (gateway_public_key, user_name) = match decode_gateway_message(&bootstrap_cipher, frame?)? {
+        Message::RegisterOkV3 {
+            gateway_public_key,
+            user_name,
+        } if v3 => (gateway_public_key, user_name),
+        Message::RegisterOk { gateway_public_key } if !v3 => {
+            (gateway_public_key, "共享 Token".into())
         }
-        other => return Err(anyhow!("unexpected register response: {other:?}")),
+        Message::Error { code, message, .. } => {
+            return Err(GatewayError::new(&code, message).into())
+        }
+        _ => return Err(anyhow!("网关注册响应类型不正确")),
     };
     let cipher = Arc::new(ephemeral_key_pair.derive_session_cipher(&gateway_public_key)?);
 
-    connection.closed.store(false, Ordering::Release);
+    {
+        let blocked = connection
+            .identity
+            .blocked
+            .lock()
+            .expect("identity lock poisoned");
+        if let Some(error) = blocked.as_ref() {
+            return Err(error.clone().into());
+        }
+        if connection.stopped.load(Ordering::Acquire) {
+            return Err(anyhow!("网关连接已停止"));
+        }
+        connection.closed.store(false, Ordering::Release);
+        connection
+            .reconnect_requested
+            .store(false, Ordering::Release);
+    }
     connection.connected.notify_waiters();
-    info!(server_url = %server_url, "gateway connected");
+    info!(server_url = %server_url, user = %user_name, "网关连接成功，鉴权通过");
 
     let mut heartbeat = interval(GATEWAY_PING_INTERVAL);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -171,7 +312,7 @@ async fn run_gateway_session(
                 Some(message) => message,
                 None => {
                     let Some(message) = outbound_rx.recv().await else {
-                        return Err(anyhow!("gateway outbound channel closed"));
+                        return Err(GatewayError::network("网关发送通道已关闭").into());
                     };
                     message
                 }
@@ -209,12 +350,9 @@ async fn run_gateway_session(
                 ws_sender
                     .feed(encrypt_access_message(&cipher, message)?)
                     .await
-                    .context("gateway websocket feed failed")?;
+                    .context("写入网关隧道失败")?;
             }
-            ws_sender
-                .flush()
-                .await
-                .context("gateway websocket flush failed")?;
+            ws_sender.flush().await.context("发送网关隧道数据失败")?;
 
             let flush_elapsed = flush_started.elapsed();
             if flush_elapsed >= WS_SLOW_FLUSH {
@@ -223,7 +361,7 @@ async fn run_gateway_session(
                     message_count,
                     batch_bytes,
                     flush_ms = flush_elapsed.as_millis(),
-                    "slow access websocket batch flush"
+                    "客户端隧道批量发送耗时较长"
                 );
             }
         }
@@ -232,33 +370,35 @@ async fn run_gateway_session(
 
     loop {
         tokio::select! {
+            biased;
+            error = connection.identity.cancelled() => return Err(error.into()),
             result = &mut writer => {
                 return result;
             }
             _ = connection.reconnect_now.notified() => {
                 if connection.stopped.load(Ordering::Acquire) {
-                    return Err(anyhow!("gateway connection stopped"));
+                    return Err(GatewayError::network("网关连接已停止").into());
                 }
 
                 if connection.reconnect_requested.load(Ordering::Acquire) {
-                    return Err(anyhow!("gateway reconnect requested"));
+                    return Err(GatewayError::network("已请求重新连接网关").into());
                 }
             }
             _ = heartbeat.tick() => {
                 if last_received.elapsed() > GATEWAY_READ_IDLE_TIMEOUT {
-                    return Err(anyhow!("gateway websocket read idle timeout"));
+                    return Err(GatewayError::network("网关隧道接收超时").into());
                 }
 
                 send_text(connection, &Message::Ping)
                     .await
-                    .context("gateway encrypted heartbeat failed")?;
+                    .context("发送加密心跳失败")?;
             }
             frame = ws_receiver.next() => {
                 let Some(frame) = frame else {
-                    return Err(anyhow!("gateway websocket closed"));
+                    return Err(GatewayError::network("网关隧道已关闭").into());
                 };
 
-                let frame = frame.context("gateway websocket read failed")?;
+                let frame = frame.context("读取网关隧道失败")?;
                 last_received = Instant::now();
                 handle_gateway_frame(connection, &cipher, frame).await?;
             }
@@ -314,14 +454,13 @@ async fn handle_gateway_frame(
 ) -> Result<()> {
     match frame {
         WsMessage::Ping(_) | WsMessage::Pong(_) => {
-            bail!("received unencrypted websocket control frame");
+            bail!("收到未加密的隧道控制帧，已拒绝");
         }
-        WsMessage::Close(_) => bail!("gateway websocket closed"),
+        WsMessage::Close(_) => return Err(GatewayError::network("网关隧道已关闭").into()),
         frame => match decrypt_gateway_frame(cipher, frame) {
             Ok((TunnelFrameKind::Text, bytes)) => {
-                let text = std::str::from_utf8(&bytes)
-                    .context("encrypted gateway text is not valid UTF-8")?;
-                let message = decode_message(text).context("invalid encrypted gateway message")?;
+                let text = std::str::from_utf8(&bytes).context("加密消息不是有效 UTF-8 文本")?;
+                let message = decode_message(text).context("网关加密消息格式错误")?;
                 handle_gateway_message(connection, message).await?;
             }
             Ok((TunnelFrameKind::Binary, bytes)) => {
@@ -332,7 +471,13 @@ async fn handle_gateway_frame(
                         .get(&stream_id)
                         .map(|entry| entry.value().clone())
                     {
-                        if tx.send(Ok(Bytes::from(payload.into_vec()))).await.is_err() {
+                        if timeout(
+                            GATEWAY_READY_TIMEOUT,
+                            tx.send(Ok(Bytes::from(payload.into_vec()))),
+                        )
+                        .await?
+                        .is_err()
+                        {
                             connection.http_body_streams.remove(&stream_id);
                             let _ = send_text(
                                 connection,
@@ -351,7 +496,10 @@ async fn handle_gateway_frame(
                         .get(&stream_id)
                         .map(|entry| entry.value().clone())
                     {
-                        if tx.send(payload).await.is_err() {
+                        if timeout(GATEWAY_READY_TIMEOUT, tx.send(payload))
+                            .await?
+                            .is_err()
+                        {
                             connection.tcp_streams.remove(&stream_id);
                             let _ = send_text(
                                 connection,
@@ -364,10 +512,7 @@ async fn handle_gateway_frame(
                         }
                     } else {
                         if connection.unknown_streams.insert(stream_id, ()).is_none() {
-                            warn!(
-                                stream_id,
-                                "received binary frame for unknown stream; requesting remote close"
-                            );
+                            warn!(stream_id, "收到未知业务流的数据，已请求远端关闭");
                             let _ = send_text(
                                 connection,
                                 &Message::Close {
@@ -379,10 +524,10 @@ async fn handle_gateway_frame(
                         }
                     }
                 } else {
-                    bail!("received invalid binary frame from gateway: len={frame_len}");
+                    bail!("收到非法网关数据帧：长度={frame_len}");
                 }
             }
-            Err(err) => return Err(err).context("failed to decrypt gateway websocket frame"),
+            Err(err) => return Err(err).context("网关隧道数据解密失败"),
         },
     }
     Ok(())
@@ -398,11 +543,9 @@ fn encrypt_access_message(cipher: &TunnelCipher, message: WsMessage) -> Result<W
         )),
         WsMessage::Close(None) => Ok(WsMessage::Close(None)),
         WsMessage::Close(Some(_)) => {
-            bail!("refusing to send a plaintext websocket close reason")
+            bail!("拒绝发送明文隧道关闭原因")
         }
-        other => Err(anyhow!(
-            "refusing to send unencrypted websocket control message: {other:?}"
-        )),
+        _ => Err(anyhow!("拒绝发送未加密的隧道控制消息")),
     }
 }
 
@@ -412,9 +555,7 @@ fn decrypt_gateway_frame(
 ) -> Result<(TunnelFrameKind, Vec<u8>)> {
     match frame {
         WsMessage::Binary(bytes) => cipher.decrypt_from_gateway(bytes),
-        other => Err(anyhow!(
-            "unexpected unencrypted gateway websocket message: {other:?}"
-        )),
+        _ => Err(anyhow!("收到不合法的未加密网关消息")),
     }
 }
 
@@ -447,21 +588,19 @@ async fn handle_gateway_message(connection: &GatewayConnection, message: Message
         Message::Close { stream_id, .. } => {
             connection.tcp_streams.remove(&stream_id);
             if let Some((_, tx)) = connection.http_head_waiters.remove(&stream_id) {
-                let _ = tx.send(Err("stream closed".to_string()));
+                let _ = tx.send(Err(GatewayError::network("连接已关闭")));
             }
             if let Some((_, tx)) = connection.http_body_streams.remove(&stream_id) {
-                let _ = tx
-                    .send(Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "stream closed",
-                    )))
-                    .await;
+                let _ = tx.try_send(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "业务连接已关闭",
+                )));
             }
             if let Some((_, tx)) = connection.open_waiters.remove(&stream_id) {
-                let _ = tx.send(Err("stream closed".to_string()));
+                let _ = tx.send(Err(GatewayError::network("连接已关闭")));
             }
             if let Some((_, tx)) = connection.http_waiters.remove(&stream_id) {
-                let _ = tx.send(Err("stream closed".to_string()));
+                let _ = tx.send(Err(GatewayError::network("连接已关闭")));
             }
         }
         Message::TcpEof { stream_id } => {
@@ -472,7 +611,13 @@ async fn handle_gateway_message(connection: &GatewayConnection, message: Message
             code,
             message,
         } => {
-            let error = format!("{code}: {message}");
+            let error = GatewayError::new(&code, message);
+            if stream_id.is_none() {
+                if error.terminal() {
+                    stop_identity(connection, error.clone());
+                }
+                return Err(error.into());
+            }
             if let Some(stream_id) = stream_id {
                 if let Some((_, tx)) = connection.open_waiters.remove(&stream_id) {
                     let _ = tx.send(Err(error.clone()));
@@ -484,23 +629,23 @@ async fn handle_gateway_message(connection: &GatewayConnection, message: Message
                     let _ = tx.send(Err(error.clone()));
                 }
                 if let Some((_, tx)) = connection.http_body_streams.remove(&stream_id) {
-                    let _ = tx.send(Err(io::Error::other(error))).await;
+                    let _ = tx.try_send(Err(io::Error::other(error)));
                 }
-            } else {
-                warn!(error = %error, "gateway error");
             }
         }
         Message::Ping => {
             send_text(connection, &Message::Pong).await?;
         }
         Message::Pong => {}
-        Message::RegisterAccess { .. }
+        Message::RegisterAccessV3 { .. }
+        | Message::RegisterOkV3 { .. }
+        | Message::RegisterAccess { .. }
         | Message::RegisterOk { .. }
         | Message::Open { .. }
         | Message::HttpRequest { .. }
         | Message::HttpRequestStart { .. }
         | Message::HttpRequestEnd { .. } => {
-            bail!("unexpected access-to-gateway message from gateway")
+            bail!("网关发送了不合法的消息类型")
         }
     }
     Ok(())
@@ -513,7 +658,7 @@ pub(crate) async fn send_text(connection: &GatewayConnection, message: &Message)
         .send(WsMessage::Text(encode_message(message)?))
         .await
     {
-        close_gateway_connection(connection, "gateway outbound channel closed");
+        close_gateway_connection(connection, "网关发送通道已关闭");
         return Err(err.into());
     }
     Ok(())
@@ -522,21 +667,27 @@ pub(crate) async fn send_text(connection: &GatewayConnection, message: &Message)
 pub(crate) async fn send_binary(connection: &GatewayConnection, frame: Vec<u8>) -> Result<()> {
     ensure_gateway_open(connection)?;
     if let Err(err) = connection.outbound.send(WsMessage::Binary(frame)).await {
-        close_gateway_connection(connection, "gateway outbound channel closed");
+        close_gateway_connection(connection, "网关发送通道已关闭");
         return Err(err.into());
     }
     Ok(())
 }
 
 fn ensure_gateway_open(connection: &GatewayConnection) -> Result<()> {
+    if let Some(error) = connection.identity.error() {
+        return Err(error.into());
+    }
     if connection.closed.load(Ordering::Acquire) || connection.outbound.is_closed() {
-        return Err(anyhow!("gateway disconnected"));
+        return Err(GatewayError::network("网关连接已断开").into());
     }
 
     Ok(())
 }
 
 pub(crate) async fn ensure_gateway_ready(connection: &GatewayConnection) -> Result<()> {
+    if let Some(error) = connection.identity.error() {
+        return Err(error.into());
+    }
     if ensure_gateway_open(connection).is_ok() {
         return Ok(());
     }
@@ -545,16 +696,26 @@ pub(crate) async fn ensure_gateway_ready(connection: &GatewayConnection) -> Resu
 
     let wait_connected = async {
         loop {
+            if connection.identity.error().is_some() {
+                return;
+            }
+            let notified = connection.connected.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if ensure_gateway_open(connection).is_ok() {
                 return;
             }
-            connection.connected.notified().await;
+            notified.await;
         }
     };
 
     match timeout(GATEWAY_READY_TIMEOUT, wait_connected).await {
         Ok(()) => ensure_gateway_open(connection),
-        Err(_) => Err(anyhow!("gateway disconnected")),
+        Err(_) => Err(connection
+            .identity
+            .error()
+            .unwrap_or_else(|| GatewayError::network("等待网关连接超时"))
+            .into()),
     }
 }
 
@@ -563,27 +724,21 @@ pub(crate) async fn stop_gateway_connections(connections: &GatewayConnections, r
         for connection in &pool.connections {
             connection.stopped.store(true, Ordering::Release);
             connection.reconnect_now.notify_waiters();
-            let _ = connection.outbound.send(WsMessage::Close(None)).await;
+            let _ = connection.outbound.try_send(WsMessage::Close(None));
             close_gateway_connection(connection, reason);
         }
     }
 }
 
 pub(crate) fn is_gateway_disconnected_error(err: &anyhow::Error) -> bool {
-    err.chain().any(|cause| {
-        matches!(
-            cause.to_string().as_str(),
-            "gateway disconnected"
-                | "gateway websocket closed"
-                | "gateway websocket write failed"
-                | "gateway error gateway websocket closed"
-                | "gateway error gateway websocket write failed"
-        )
-    })
+    if let Some(error) = err.downcast_ref::<GatewayError>() {
+        return matches!(error.code.as_str(), "GATEWAY_DISCONNECTED" | "AUTH_CHANGED");
+    }
+    false
 }
 
 fn request_gateway_reconnect(connection: &GatewayConnection) {
-    if !connection.stopped.load(Ordering::Acquire) {
+    if !connection.stopped.load(Ordering::Acquire) && connection.identity.error().is_none() {
         connection
             .reconnect_requested
             .store(true, Ordering::Release);
@@ -595,8 +750,7 @@ fn close_gateway_connection(connection: &GatewayConnection, reason: &str) {
     if connection.closed.swap(true, Ordering::AcqRel) {
         return;
     }
-
-    request_gateway_reconnect(connection);
+    connection.connected.notify_waiters();
 
     connection.tcp_streams.clear();
     connection.unknown_streams.clear();
@@ -608,7 +762,10 @@ fn close_gateway_connection(connection: &GatewayConnection, reason: &str) {
         .collect::<Vec<_>>();
     for stream_id in open_waiters {
         if let Some((_, tx)) = connection.open_waiters.remove(&stream_id) {
-            let _ = tx.send(Err(reason.to_string()));
+            let _ = tx.send(Err(connection
+                .identity
+                .error()
+                .unwrap_or_else(|| GatewayError::network(reason))));
         }
     }
 
@@ -619,7 +776,10 @@ fn close_gateway_connection(connection: &GatewayConnection, reason: &str) {
         .collect::<Vec<_>>();
     for stream_id in http_waiters {
         if let Some((_, tx)) = connection.http_waiters.remove(&stream_id) {
-            let _ = tx.send(Err(reason.to_string()));
+            let _ = tx.send(Err(connection
+                .identity
+                .error()
+                .unwrap_or_else(|| GatewayError::network(reason))));
         }
     }
 
@@ -630,7 +790,10 @@ fn close_gateway_connection(connection: &GatewayConnection, reason: &str) {
         .collect::<Vec<_>>();
     for stream_id in http_head_waiters {
         if let Some((_, tx)) = connection.http_head_waiters.remove(&stream_id) {
-            let _ = tx.send(Err(reason.to_string()));
+            let _ = tx.send(Err(connection
+                .identity
+                .error()
+                .unwrap_or_else(|| GatewayError::network(reason))));
         }
     }
 
@@ -648,13 +811,15 @@ fn close_gateway_connection(connection: &GatewayConnection, reason: &str) {
         }
     }
 
-    warn!(server_url = %connection.server_url, reason = %reason, "gateway connection closed");
+    if connection.identity.error().is_none() {
+        warn!(server_url = %connection.server_url, reason = %reason, "网关连接已关闭");
+    }
 }
 
 fn decode_gateway_message(cipher: &TunnelCipher, message: WsMessage) -> Result<Message> {
     let (kind, bytes) = decrypt_gateway_frame(cipher, message)?;
     if kind != TunnelFrameKind::Text {
-        return Err(anyhow!("expected encrypted gateway text message"));
+        return Err(anyhow!("预期收到加密的网关文本消息"));
     }
     Ok(decode_message(std::str::from_utf8(&bytes)?)?)
 }
@@ -663,12 +828,60 @@ pub(crate) fn next_stream_id(connection: &GatewayConnection) -> StreamId {
     connection.stream_ids.fetch_add(1, Ordering::Relaxed)
 }
 
+pub(crate) async fn gateway_closed(connection: &GatewayConnection) -> GatewayError {
+    loop {
+        let notified = connection.connected.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if let Some(error) = connection.identity.error() {
+            return error;
+        }
+        if connection.closed.load(Ordering::Acquire) || connection.stopped.load(Ordering::Acquire) {
+            return GatewayError::network("网关会话已结束，当前业务连接已关闭");
+        }
+        notified.await;
+    }
+}
+
+async fn gateway_stopped(connection: &GatewayConnection) {
+    loop {
+        let notified = connection.reconnect_now.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if connection.stopped.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tokio_tungstenite::tungstenite::Message as WsMessage;
     use ws_net_common::{decode_data_frame, encode_data_frame};
 
     use super::{push_ws_message, ws_message_size};
+
+    #[tokio::test]
+    async fn blocked_identity_survives_pool_reload_and_is_gateway_scoped() {
+        use crate::app::AccessRuntime;
+        use ws_net_common::GatewayError;
+        let runtime = AccessRuntime::new().unwrap();
+        let a = runtime.identity("ws://a.example/tunnel", "same").unwrap();
+        let b = runtime.identity("ws://b.example/tunnel", "same").unwrap();
+        *a.blocked.lock().unwrap() = Some(GatewayError::replaced());
+        a.changed.notify_waiters();
+        assert_eq!(a.cancelled().await.code, "SESSION_REPLACED");
+        let reloaded = runtime.identity("ws://a.example/tunnel", "same").unwrap();
+        assert!(std::sync::Arc::ptr_eq(&a, &reloaded));
+        assert!(reloaded.error().is_some());
+        assert!(b.error().is_none());
+        assert!(runtime
+            .identity("ws://a.example/tunnel", "new")
+            .unwrap()
+            .error()
+            .is_none());
+    }
 
     #[test]
     fn writer_batch_merges_same_stream_payloads() {
@@ -689,6 +902,46 @@ mod tests {
             panic!("expected binary frame");
         };
         assert_eq!(decode_data_frame(frame), Some((21, b"leftright".to_vec())));
+    }
+
+    #[tokio::test]
+    async fn invalid_later_gateway_does_not_start_earlier_pool() {
+        use crate::app::AccessRuntime;
+        use ws_net_common::{AccessConfig, AccessGatewayConfig, AccessSection};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = AccessConfig {
+            access: AccessSection {
+                token: None,
+                server_url: None,
+                server_urls: vec![],
+                gateway_pool_size: 1,
+            },
+            gateways: [
+                (
+                    "first",
+                    format!("ws://{}/tunnel", listener.local_addr().unwrap()),
+                ),
+                ("invalid", "not-a-url".into()),
+            ]
+            .into_iter()
+            .map(|(name, server_url)| AccessGatewayConfig {
+                name: name.into(),
+                server_url,
+                token: "user".into(),
+            })
+            .collect(),
+            listeners: vec![],
+        };
+        assert!(
+            super::connect_all_registered(&config, &AccessRuntime::new().unwrap())
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
     }
 
     #[test]

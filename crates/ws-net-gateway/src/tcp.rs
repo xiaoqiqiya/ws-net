@@ -1,5 +1,6 @@
 use std::{
     io,
+    net::SocketAddr,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -16,10 +17,9 @@ use tokio::{
     time::Instant,
 };
 use tracing::{info, warn};
-use ws_net_common::{
-    new_data_frame_buffer, DataFramePayload, Message, TargetConfig, DATA_FRAME_HEADER_LEN,
-};
+use ws_net_common::{new_data_frame_buffer, DataFramePayload, Message, DATA_FRAME_HEADER_LEN};
 
+use crate::app::SessionLease;
 use crate::ws::{send_error, send_text, Outbound};
 
 const TCP_BUFFER_SIZE: usize = 64 * 1024;
@@ -54,6 +54,8 @@ impl StreamCancellation {
                 return;
             }
             let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if self.canceled.load(Ordering::Acquire) {
                 return;
             }
@@ -65,21 +67,23 @@ impl StreamCancellation {
 pub(crate) async fn handle_tcp_stream(
     stream_id: u64,
     target_name: String,
-    target: TargetConfig,
+    address: Vec<SocketAddr>,
+    lease: Arc<SessionLease>,
     outbound: Outbound,
     streams: TcpStreams,
-    cancels: StreamCancels,
-    cancellation: Arc<StreamCancellation>,
+    cancellation: (StreamCancels, Arc<StreamCancellation>),
 ) {
-    if let Err(err) = handle_tcp_stream_result(
-        stream_id,
-        target_name,
-        target,
-        &outbound,
-        &streams,
-        cancellation.clone(),
-    )
-    .await
+    let (cancels, cancellation) = cancellation;
+    if let Err(err) = lease
+        .run(handle_tcp_stream_result(
+            stream_id,
+            target_name,
+            address,
+            &outbound,
+            &streams,
+            cancellation.clone(),
+        ))
+        .await
     {
         let _ = send_error(
             &outbound,
@@ -104,18 +108,18 @@ pub(crate) async fn handle_tcp_stream(
 async fn handle_tcp_stream_result(
     stream_id: u64,
     target_name: String,
-    target: TargetConfig,
+    address: Vec<SocketAddr>,
     outbound: &Outbound,
     streams: &TcpStreams,
     cancellation: Arc<StreamCancellation>,
 ) -> Result<()> {
     let session_started = Instant::now();
-    let addr = format!("{}:{}", target.host, target.port);
-    let socket = TcpStream::connect(&addr)
+    let addr = address;
+    let socket = TcpStream::connect(addr.as_slice())
         .await
-        .with_context(|| format!("connect target {addr}"))?;
+        .with_context(|| format!("连接授权目标失败：{addr:?}"))?;
     socket.set_nodelay(true)?;
-    info!(stream_id, target = %target_name, addr = %addr, "tcp target connected");
+    info!(stream_id, target = %target_name, addr = ?addr, "目标 TCP 连接成功");
 
     let (write_tx, mut write_rx) = mpsc::channel::<DataFramePayload>(TCP_STREAM_CHANNEL_CAPACITY);
     streams.insert(stream_id, write_tx);

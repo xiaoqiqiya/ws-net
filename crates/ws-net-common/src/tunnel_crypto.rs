@@ -4,8 +4,8 @@ use anyhow::{anyhow, bail, Result};
 use ring::{
     aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305},
     agreement::{self, EphemeralPrivateKey, UnparsedPublicKey, X25519},
-    hkdf,
-    rand::SystemRandom,
+    digest, hkdf,
+    rand::{SecureRandom, SystemRandom},
 };
 
 const FRAME_MAGIC: &[u8; 4] = b"WSNE";
@@ -19,6 +19,34 @@ const GATEWAY_TO_ACCESS: &[u8] = b"ws-net/gateway-to-access/v2";
 const BOOTSTRAP_CONTEXT: &[u8] = b"ws-net/bootstrap/v2";
 const SESSION_CONTEXT: &[u8] = b"ws-net/session/v2";
 pub const MAX_ENCRYPTED_TUNNEL_FRAME_SIZE: usize = 16 * 1024 * 1024;
+
+pub const PROTOCOL_HEADER: &str = "x-ws-net-protocol";
+pub const CREDENTIAL_HEADER: &str = "x-ws-net-credential";
+pub const CLIENT_NONCE_HEADER: &str = "x-ws-net-client-nonce";
+pub const SERVER_NONCE_HEADER: &str = "x-ws-net-server-nonce";
+
+pub fn random_id() -> Result<String> {
+    let mut bytes = [0_u8; 32];
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| anyhow!("无法生成安全随机数"))?;
+    Ok(hex(&bytes))
+}
+
+pub fn credential_id(token: &str) -> String {
+    let mut context = digest::Context::new(&digest::SHA256);
+    context.update(b"ws-net/credential/v3\0");
+    context.update(token.as_bytes());
+    hex(context.finish().as_ref())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+pub fn valid_id(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TunnelFrameKind {
@@ -180,6 +208,28 @@ impl EphemeralKeyPair {
 }
 
 impl TunnelCipher {
+    pub fn from_connection_key(
+        token: &str,
+        client_nonce: &str,
+        server_nonce: &str,
+    ) -> Result<Self> {
+        if token.trim().is_empty() || !valid_id(client_nonce) || !valid_id(server_nonce) {
+            bail!("非法握手材料");
+        }
+        let salt = format!("ws-net/bootstrap/v3/{client_nonce}/{server_nonce}");
+        let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, salt.as_bytes()).extract(token.as_bytes());
+        Ok(Self {
+            access_to_gateway: DirectionCipher::new(
+                derive_key(&prk, b"ws-net/bootstrap/v3", ACCESS_TO_GATEWAY)?,
+                *b"A2GW",
+            ),
+            gateway_to_access: DirectionCipher::new(
+                derive_key(&prk, b"ws-net/bootstrap/v3", GATEWAY_TO_ACCESS)?,
+                *b"G2AC",
+            ),
+        })
+    }
+
     pub fn from_shared_key(shared_key: &str) -> Result<Self> {
         if shared_key.trim().is_empty() {
             bail!("tunnel bootstrap secret must not be empty");
@@ -247,6 +297,30 @@ fn sequence_nonce(prefix: [u8; 4], sequence: u64) -> [u8; 12] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_bootstrap_is_unique_authenticated_and_not_a_selector_proof() {
+        let client = random_id().unwrap();
+        let server = random_id().unwrap();
+        let sender = TunnelCipher::from_connection_key("secret", &client, &server).unwrap();
+        let receiver = TunnelCipher::from_connection_key("secret", &client, &server).unwrap();
+        let frame = sender
+            .encrypt_from_access(TunnelFrameKind::Text, b"register")
+            .unwrap();
+        assert_eq!(
+            receiver.decrypt_from_access(frame.clone()).unwrap().1,
+            b"register"
+        );
+        assert!(receiver.decrypt_from_access(frame.clone()).is_err());
+        let other =
+            TunnelCipher::from_connection_key("secret", &client, &random_id().unwrap()).unwrap();
+        assert!(other.decrypt_from_access(frame.clone()).is_err());
+        let wrong =
+            TunnelCipher::from_connection_key(&credential_id("secret"), &client, &server).unwrap();
+        assert!(wrong.decrypt_from_access(frame).is_err());
+        assert!(valid_id(&client));
+        assert_ne!(credential_id("secret"), credential_id("different"));
+    }
 
     #[test]
     fn encrypts_authenticates_and_rejects_replay() {

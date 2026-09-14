@@ -1,4 +1,9 @@
-use std::{fs, path::Path};
+use std::{
+    fs,
+    net::{IpAddr, SocketAddr},
+    path::Path,
+    str::FromStr,
+};
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -9,9 +14,11 @@ use crate::Mode;
 pub struct GatewayConfig {
     pub gateway: GatewaySection,
     pub auth: GatewayAuth,
+    #[serde(default)]
+    pub users: Vec<GatewayUser>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct GatewaySection {
     pub listen: String,
     #[serde(default = "default_tunnel_path")]
@@ -21,6 +28,125 @@ pub struct GatewaySection {
 #[derive(Debug, Clone, Deserialize)]
 pub struct GatewayAuth {
     pub access_token: String,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_single_access")]
+    pub single_access: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GatewayUser {
+    pub name: String,
+    pub token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub single_access: Option<bool>,
+    #[serde(default)]
+    pub allow: Vec<String>,
+}
+
+impl GatewayUser {
+    pub fn single_access(&self, auth: &GatewayAuth) -> bool {
+        self.single_access.unwrap_or(auth.single_access)
+    }
+
+    pub fn rules(&self) -> Result<Vec<AccessRule>> {
+        self.allow.iter().map(|rule| rule.parse()).collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccessRule {
+    Any,
+    Address { ip: IpAddr, port: Option<u16> },
+}
+
+impl FromStr for AccessRule {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        if value == "*" {
+            return Ok(Self::Any);
+        }
+        let (host, port) = value
+            .rsplit_once(':')
+            .ok_or_else(|| anyhow::anyhow!("访问规则必须为 IP:port、IP:* 或 *"))?;
+        let host = if host.starts_with('[') && host.ends_with(']') {
+            &host[1..host.len() - 1]
+        } else {
+            if host.contains(':') {
+                bail!("IPv6 访问规则必须使用 [地址]:port 格式");
+            }
+            host
+        };
+        let ip = host
+            .parse()
+            .map_err(|_| anyhow::anyhow!("访问规则包含非法 IP 地址"))?;
+        let port = if port == "*" {
+            None
+        } else {
+            if port.is_empty() || !port.bytes().all(|c| c.is_ascii_digit()) {
+                bail!("访问规则包含非法端口");
+            }
+            let port: u16 = port
+                .parse()
+                .map_err(|_| anyhow::anyhow!("端口必须为 1～65535"))?;
+            if port == 0 {
+                bail!("端口必须为 1～65535");
+            }
+            Some(port)
+        };
+        Ok(Self::Address { ip, port })
+    }
+}
+
+impl AccessRule {
+    pub fn allows(&self, address: SocketAddr) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Address { ip, port } => {
+                *ip == address.ip() && port.is_none_or(|port| port == address.port())
+            }
+        }
+    }
+
+    pub fn covers(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Any, _) => true,
+            (
+                Self::Address { ip, port },
+                Self::Address {
+                    ip: other_ip,
+                    port: other_port,
+                },
+            ) => ip == other_ip && (port.is_none() || port == other_port),
+            _ => false,
+        }
+    }
+}
+
+pub fn validate_username(name: &str) -> Result<()> {
+    if name.trim().is_empty() || name.chars().any(char::is_control) {
+        bail!("用户名不能为空、纯空白或包含控制字符");
+    }
+    Ok(())
+}
+
+fn default_single_access() -> bool {
+    true
+}
+
+fn config_parse_error(content: &str, error: toml::de::Error) -> anyhow::Error {
+    // Parser diagnostics can contain the offending string, including a Token.
+    let line = error.span().map(|span| {
+        1 + content.as_bytes()[..span.start.min(content.len())]
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count()
+    });
+    match line {
+        Some(line) => anyhow::anyhow!("配置格式错误（第 {line} 行），请检查 TOML 语法及字段类型"),
+        None => anyhow::anyhow!("配置格式错误，请检查 TOML 语法及字段类型"),
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -110,14 +236,55 @@ impl ListenerConfig {
 impl GatewayConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let content = fs::read_to_string(path)?;
-        Ok(toml::from_str(&content)?)
+        let config: Self =
+            toml::from_str(&content).map_err(|error| config_parse_error(&content, error))?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.auth.access_token.trim().is_empty() {
+            bail!("共享 access_token 不能为空");
+        }
+        self.gateway
+            .listen
+            .parse::<SocketAddr>()
+            .map_err(|_| anyhow::anyhow!("gateway.listen 必须为合法的 IP:port"))?;
+        if !self.gateway.path.starts_with('/') || self.gateway.path.contains(['?', '#']) {
+            bail!("gateway.path 必须为以 / 开头的路径");
+        }
+        for (index, user) in self.users.iter().enumerate() {
+            validate_username(&user.name)?;
+            if user.token.trim().is_empty() {
+                bail!("用户“{}”的 Token 不能为空", user.name);
+            }
+            if user.token == self.auth.access_token {
+                bail!("用户 Token 不能与共享 Token 相同");
+            }
+            if self.users[..index]
+                .iter()
+                .any(|previous| previous.name == user.name)
+            {
+                bail!("用户“{}”重复", user.name);
+            }
+            if self.users[..index]
+                .iter()
+                .any(|previous| previous.token == user.token)
+            {
+                bail!("用户“{}”的 Token 与其他用户重复", user.name);
+            }
+            user.rules()
+                .map_err(|err| anyhow::anyhow!("用户“{}”的访问规则错误：{err}", user.name))?;
+        }
+        Ok(())
     }
 }
 
 impl AccessConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let content = fs::read_to_string(path)?;
-        let config: Self = toml::from_str(&content)?;
+        let config: Self =
+            toml::from_str(&content).map_err(|error| config_parse_error(&content, error))?;
         config.gateway_configs()?;
         Ok(config)
     }
@@ -129,7 +296,7 @@ impl AccessConfig {
                 .token
                 .as_deref()
                 .filter(|token| !token.trim().is_empty())
-                .ok_or_else(|| anyhow::anyhow!("legacy access config requires access.token"))?;
+                .ok_or_else(|| anyhow::anyhow!("未鉴权：请在 access 配置中填写 Token"))?;
             let mut urls = Vec::new();
             if let Some(server_url) = self.access.server_url.as_ref() {
                 let server_url = server_url.trim();
@@ -170,18 +337,18 @@ impl AccessConfig {
         }
 
         if gateways.is_empty() {
-            bail!("access config requires at least one gateway");
+            bail!("access 至少需要配置一个网关");
         }
 
         for gateway in &gateways {
             if gateway.name.is_empty() {
-                bail!("gateway name must not be empty");
+                bail!("网关名称不能为空");
             }
             if gateway.server_url.is_empty() {
-                bail!("gateway '{}' server_url must not be empty", gateway.name);
+                bail!("网关“{}”的 server_url 不能为空", gateway.name);
             }
             if gateway.token.trim().is_empty() {
-                bail!("gateway '{}' token must not be empty", gateway.name);
+                bail!("未鉴权：网关“{}”的 Token 不能为空", gateway.name);
             }
         }
 
@@ -190,7 +357,7 @@ impl AccessConfig {
                 .iter()
                 .any(|candidate| candidate.name == gateway.name)
             {
-                bail!("duplicate gateway name '{}'", gateway.name);
+                bail!("网关名称“{}”重复", gateway.name);
             }
         }
 
@@ -215,7 +382,7 @@ impl AccessConfig {
 
             if gateway_name.is_some() && server_url.is_some() {
                 bail!(
-                    "listener '{}' must not set both gateway and server_url",
+                    "监听器“{}”不能同时配置 gateway 和 server_url",
                     listener.name
                 );
             }
@@ -223,7 +390,7 @@ impl AccessConfig {
             if let Some(gateway_name) = gateway_name {
                 if !gateways.iter().any(|gateway| gateway.name == gateway_name) {
                     bail!(
-                        "listener '{}' references unavailable gateway '{}'",
+                        "监听器“{}”引用了不存在的网关“{}”",
                         listener.name,
                         gateway_name
                     );
@@ -234,16 +401,13 @@ impl AccessConfig {
                     .any(|gateway| gateway.server_url == server_url)
                 {
                     bail!(
-                        "listener '{}' references unavailable gateway '{}'",
+                        "监听器“{}”引用了不存在的网关“{}”",
                         listener.name,
                         server_url
                     );
                 }
             } else if !has_default_gateway {
-                bail!(
-                    "listener '{}' must set gateway or server_url",
-                    listener.name
-                );
+                bail!("监听器“{}”必须指定 gateway 或 server_url", listener.name);
             }
         }
 
@@ -273,6 +437,102 @@ fn default_gateway_pool_size() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_diagnostics_locate_error_without_echoing_token() {
+        let content = "[gateway]\nlisten = \"127.0.0.1:8443\"\n[auth]\naccess_token = \"shared\"\nenabled = \"private-token-must-not-be-logged\"\n";
+        let error = toml::from_str::<GatewayConfig>(content).unwrap_err();
+        let message = config_parse_error(content, error).to_string();
+        assert!(message.contains("第 5 行"));
+        assert!(!message.contains("private-token"));
+    }
+
+    #[test]
+    fn user_defaults_overrides_rules_and_validation() {
+        let mut config: GatewayConfig = toml::from_str(
+            r#"
+            [gateway]
+            listen = "127.0.0.1:8443"
+            [auth]
+            enabled = true
+            access_token = "shared"
+            single_access = false
+            [[users]]
+            name = "研发 李四"
+            token = "user"
+            allow = ["192.168.1.20:*", "127.0.0.1:22", "[::1]:443"]
+        "#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.users[0].single_access, None);
+        assert!(!config.users[0].single_access(&config.auth));
+        config.users[0].single_access = Some(true);
+        assert!(config.users[0].single_access(&config.auth));
+        config.auth.single_access = true;
+        config.users[0].single_access = Some(false);
+        assert!(!config.users[0].single_access(&config.auth));
+        let rules = config.users[0].rules().unwrap();
+        for address in ["192.168.1.20:3306", "127.0.0.1:22", "[::1]:443"] {
+            assert!(rules
+                .iter()
+                .any(|rule| rule.allows(address.parse().unwrap())));
+        }
+        assert!(!rules
+            .iter()
+            .any(|rule| rule.allows("127.0.0.1:3306".parse().unwrap())));
+        for bad in [
+            "",
+            "host:22",
+            "127.0.0.1:0",
+            "127.0.0.1:65536",
+            "127.0.0.1:+22",
+            "::1:22",
+            "10.0.0.0/24:*",
+        ] {
+            assert!(bad.parse::<AccessRule>().is_err(), "{bad}");
+        }
+        assert!("*".parse::<AccessRule>().unwrap().covers(&rules[0]));
+        assert!(rules[0].covers(&"192.168.1.20:22".parse().unwrap()));
+        config.users.push(config.users[0].clone());
+        assert!(config.validate().is_err());
+        config.users.pop();
+        config.users[0].token = "shared".into();
+        assert!(config.validate().is_err());
+        assert!(validate_username(" \t").is_err());
+        assert!(validate_username("张\n三").is_err());
+    }
+
+    #[test]
+    fn legacy_gateway_and_cross_gateway_same_token_remain_valid() {
+        let config: GatewayConfig = toml::from_str(
+            r#"
+            [gateway]
+            listen = "127.0.0.1:8443"
+            [auth]
+            access_token = "shared"
+        "#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert!(!config.auth.enabled);
+        assert!(config.auth.single_access);
+        let config: AccessConfig = toml::from_str(
+            r#"
+            [access]
+            [[gateways]]
+            name = "a"
+            server_url = "ws://a/tunnel"
+            token = "same"
+            [[gateways]]
+            name = "b"
+            server_url = "ws://b/tunnel"
+            token = "same"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(config.gateway_configs().unwrap().len(), 2);
+    }
 
     #[test]
     fn parses_gateway_specific_tokens() {

@@ -3,24 +3,27 @@ use std::{sync::Arc, time::Duration};
 use anyhow::{anyhow, bail, Result};
 use axum::{
     extract::{ws::WebSocketUpgrade, State},
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::IntoResponse,
+    Json,
 };
 use dashmap::DashMap;
 use futures_util::{future::FutureExt, SinkExt, StreamExt};
 use tokio::{
     sync::mpsc,
     task::AbortHandle,
-    time::{interval, Instant, MissedTickBehavior},
+    time::{interval, timeout, Instant, MissedTickBehavior},
 };
 use tracing::warn;
 use ws_net_common::{
-    decode_data_frame_owned, decode_message, encode_data_frame, encode_message,
-    try_merge_data_frames, HttpRequestHead, HttpResponsePayload, Message, Mode, TunnelCipher,
-    TunnelFrameKind, DATA_FRAME_HEADER_LEN, MAX_ENCRYPTED_TUNNEL_FRAME_SIZE,
+    decode_data_frame_owned, decode_message, encode_data_frame, encode_message, random_id,
+    try_merge_data_frames, valid_id, GatewayError, HttpRequestHead, HttpResponsePayload, Message,
+    Mode, TunnelCipher, TunnelFrameKind, CLIENT_NONCE_HEADER, CREDENTIAL_HEADER,
+    DATA_FRAME_HEADER_LEN, MAX_ENCRYPTED_TUNNEL_FRAME_SIZE, PROTOCOL_HEADER, SERVER_NONCE_HEADER,
 };
 
 use crate::{
-    app::AppState,
+    app::{AppState, SessionLease},
     http_proxy::{format_error_chain, handle_http_request},
     tcp::{handle_tcp_stream, StreamCancellation, StreamCancels, TcpStreams},
 };
@@ -64,69 +67,187 @@ impl Drop for SessionCleanup {
 pub(crate) async fn ws_entry(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
-) -> impl IntoResponse {
-    ws.max_message_size(MAX_ENCRYPTED_TUNNEL_FRAME_SIZE)
+    headers: HeaderMap,
+) -> axum::response::Response {
+    let bootstrap = if let Some(version) = headers.get(PROTOCOL_HEADER) {
+        if version != "3" {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(GatewayError::new("PROTOCOL_ERROR", "不支持的隧道协议版本")),
+            )
+                .into_response();
+        }
+        let id = headers
+            .get(CREDENTIAL_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        let client_nonce = headers
+            .get(CLIENT_NONCE_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        if !valid_id(id) || !valid_id(client_nonce) {
+            return (StatusCode::UNAUTHORIZED, Json(GatewayError::unauthorized())).into_response();
+        }
+        let token = match state.token(id) {
+            Ok(token) => token,
+            Err(_) => {
+                return (StatusCode::UNAUTHORIZED, Json(GatewayError::unauthorized()))
+                    .into_response()
+            }
+        };
+        let server_nonce = match random_id() {
+            Ok(nonce) => nonce,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        let cipher = match TunnelCipher::from_connection_key(&token, client_nonce, &server_nonce) {
+            Ok(cipher) => cipher,
+            Err(_) => {
+                return (StatusCode::UNAUTHORIZED, Json(GatewayError::unauthorized()))
+                    .into_response()
+            }
+        };
+        Some((token, cipher, server_nonce))
+    } else {
+        None
+    };
+    let server_nonce = bootstrap.as_ref().map(|(_, _, nonce)| nonce.clone());
+    let mut response = ws
+        .max_message_size(MAX_ENCRYPTED_TUNNEL_FRAME_SIZE)
         .max_frame_size(MAX_ENCRYPTED_TUNNEL_FRAME_SIZE)
-        .on_upgrade(move |socket| handle_socket(socket, state))
+        .on_upgrade(move |socket| handle_socket(socket, state, bootstrap))
+        .into_response();
+    if let Some(nonce) = server_nonce {
+        response.headers_mut().insert(
+            SERVER_NONCE_HEADER,
+            HeaderValue::from_str(&nonce).expect("hex header"),
+        );
+    }
+    response
 }
 
-async fn handle_socket(socket: axum::extract::ws::WebSocket, state: AppState) {
-    if let Err(err) = handle_socket_result(socket, state).await {
-        warn!(error = %err, "websocket session ended");
+async fn handle_socket(
+    socket: axum::extract::ws::WebSocket,
+    state: AppState,
+    bootstrap: Option<(String, TunnelCipher, String)>,
+) {
+    if let Err(err) = handle_socket_result(socket, state, bootstrap).await {
+        warn!(error = %err, "网关隧道会话结束");
     }
 }
 
-async fn handle_socket_result(socket: axum::extract::ws::WebSocket, state: AppState) -> Result<()> {
+async fn handle_socket_result(
+    socket: axum::extract::ws::WebSocket,
+    state: AppState,
+    bootstrap: Option<(String, TunnelCipher, String)>,
+) -> Result<()> {
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
-    let bootstrap_cipher = TunnelCipher::from_shared_key(&state.config.auth.access_token)?;
-    let Some(Ok(first)) = ws_receiver.next().await else {
+    let v3 = bootstrap.is_some();
+    let (token, bootstrap_cipher) = match bootstrap {
+        Some((token, cipher, _)) => (token, cipher),
+        None => {
+            let token = state.config().auth.access_token;
+            let cipher = TunnelCipher::from_shared_key(&token)?;
+            (token, cipher)
+        }
+    };
+    let Some(Ok(first)) = timeout(Duration::from_secs(10), ws_receiver.next()).await? else {
         return Err(anyhow!("expected encrypted register message"));
     };
 
-    let client_public_key = match decode_access_message(&bootstrap_cipher, first)? {
-        Message::RegisterAccess {
-            token,
+    let (instance, client_public_key) = match decode_access_message(&bootstrap_cipher, first) {
+        Ok(Message::RegisterAccessV3 {
+            instance_id,
             client_public_key,
-        } if token == state.config.auth.access_token => client_public_key,
-        Message::RegisterAccess { .. } => {
+        }) if v3 => (instance_id, client_public_key),
+        Ok(Message::RegisterAccess {
+            token: submitted,
+            client_public_key,
+        }) if !v3 && submitted == token => (random_id()?, client_public_key),
+        _ => {
             ws_sender
                 .send(encrypt_gateway_message(
                     &bootstrap_cipher,
                     axum::extract::ws::Message::Text(encode_message(&Message::Error {
                         stream_id: None,
                         code: "UNAUTHORIZED".to_string(),
-                        message: "invalid access token".to_string(),
+                        message: GatewayError::unauthorized().message,
                     })?),
                 )?)
                 .await?;
             return Ok(());
         }
-        _ => return Err(anyhow!("first message must be RegisterAccess")),
     };
     let ephemeral_key_pair = ws_net_common::EphemeralKeyPair::generate()?;
     let gateway_public_key = ephemeral_key_pair.public_key().to_vec();
     let cipher = Arc::new(ephemeral_key_pair.derive_session_cipher(&client_public_key)?);
 
+    let (lease, user_name) = match state.register(&token, &instance, !v3) {
+        Ok(registration) => registration,
+        Err(error) => {
+            let error = error
+                .downcast_ref::<GatewayError>()
+                .cloned()
+                .unwrap_or_else(GatewayError::unauthorized);
+            ws_sender
+                .send(encrypt_gateway_message(
+                    &bootstrap_cipher,
+                    axum::extract::ws::Message::Text(encode_message(&Message::Error {
+                        stream_id: None,
+                        code: error.code,
+                        message: error.message,
+                    })?),
+                )?)
+                .await?;
+            return Ok(());
+        }
+    };
+
     let (outbound, mut outbound_rx) = mpsc::channel::<axum::extract::ws::Message>(1024);
-    ws_sender
-        .send(encrypt_gateway_message(
-            &bootstrap_cipher,
-            axum::extract::ws::Message::Text(encode_message(&Message::RegisterOk {
-                gateway_public_key,
-            })?),
-        )?)
+    lease
+        .run(async {
+            ws_sender
+                .send(encrypt_gateway_message(
+                    &bootstrap_cipher,
+                    axum::extract::ws::Message::Text(encode_message(&if v3 {
+                        Message::RegisterOkV3 {
+                            gateway_public_key,
+                            user_name,
+                        }
+                    } else {
+                        Message::RegisterOk { gateway_public_key }
+                    })?),
+                )?)
+                .await
+                .map_err(anyhow::Error::from)
+        })
         .await?;
 
     let writer_cipher = cipher.clone();
-    let writer = tokio::spawn(async move {
+    let writer_lease = lease.clone();
+    let mut writer = tokio::spawn(async move {
         let mut pending = None;
 
         loop {
             let first = match pending.take() {
                 Some(message) => message,
                 None => {
-                    let Some(message) = outbound_rx.recv().await else {
+                    let message = tokio::select! {
+                        biased;
+                        error = writer_lease.cancelled() => {
+                            let _ = timeout(Duration::from_secs(1), async {
+                                if let Ok(message) = encode_message(&Message::Error { stream_id: None, code: error.code, message: error.message }) {
+                                    if let Ok(frame) = encrypt_gateway_message(&writer_cipher, axum::extract::ws::Message::Text(message)) {
+                                        let _ = ws_sender.send(frame).await;
+                                    }
+                                }
+                                let _ = ws_sender.close().await;
+                            }).await;
+                            break;
+                        }
+                        message = outbound_rx.recv() => message,
+                    };
+                    let Some(message) = message else {
                         break;
                     };
                     message
@@ -161,22 +282,39 @@ async fn handle_socket_result(socket: axum::extract::ws::WebSocket, state: AppSt
 
             let message_count = batch.len();
             let flush_started = Instant::now();
-            let mut write_failed = false;
-            for message in batch {
-                let message = match encrypt_gateway_message(&writer_cipher, message) {
-                    Ok(message) => message,
-                    Err(err) => {
-                        warn!(error = %err, "failed to encrypt gateway websocket message");
-                        write_failed = true;
-                        break;
+            let write_result = writer_lease
+                .run(async {
+                    for message in batch {
+                        ws_sender
+                            .feed(encrypt_gateway_message(&writer_cipher, message)?)
+                            .await?;
                     }
-                };
-                if ws_sender.feed(message).await.is_err() {
-                    write_failed = true;
-                    break;
+                    ws_sender.flush().await?;
+                    Ok(())
+                })
+                .await;
+            if write_result.is_err() {
+                if let Err(error) = writer_lease.check() {
+                    if let Some(error) = error.downcast_ref::<GatewayError>() {
+                        let error = error.clone();
+                        let _ = timeout(Duration::from_secs(1), async {
+                            let frame = encrypt_gateway_message(
+                                &writer_cipher,
+                                axum::extract::ws::Message::Text(encode_message(
+                                    &Message::Error {
+                                        stream_id: None,
+                                        code: error.code,
+                                        message: error.message,
+                                    },
+                                )?),
+                            )?;
+                            ws_sender.send(frame).await?;
+                            ws_sender.close().await?;
+                            Ok::<_, anyhow::Error>(())
+                        })
+                        .await;
+                    }
                 }
-            }
-            if write_failed || ws_sender.flush().await.is_err() {
                 break;
             }
 
@@ -207,6 +345,14 @@ async fn handle_socket_result(socket: axum::extract::ws::WebSocket, state: AppSt
 
     loop {
         tokio::select! {
+            biased;
+            _ = lease.cancelled() => {
+                for cancellation in stream_cancels.iter() { cancellation.value().cancel(); }
+                streams.clear(); http_bodies.clear();
+                let _ = timeout(Duration::from_secs(2), &mut writer).await;
+                return Ok(());
+            }
+            _ = &mut writer => return Err(anyhow!("网关隧道写任务已结束")),
             _ = heartbeat.tick() => {
                 if last_received.elapsed() > ACCESS_READ_IDLE_TIMEOUT {
                     return Err(anyhow!("access websocket read idle timeout"));
@@ -227,6 +373,7 @@ async fn handle_socket_result(socket: axum::extract::ws::WebSocket, state: AppSt
                 };
 
                 last_received = Instant::now();
+                let result = lease.run(async {
                 match frame {
                     axum::extract::ws::Message::Binary(bytes) => {
                         let (kind, bytes) = cipher.decrypt_from_access(bytes)?;
@@ -234,22 +381,23 @@ async fn handle_socket_result(socket: axum::extract::ws::WebSocket, state: AppSt
                             let text = std::str::from_utf8(&bytes)?;
                             handle_text_message(
                                 &state,
+                                &lease,
                                 &outbound,
                                 &streams,
                                 &stream_cancels,
                                 &http_bodies,
                                 text,
                             ).await?;
-                            continue;
+                            return Ok(true);
                         }
                         let frame_len = bytes.len();
                         if let Some((stream_id, payload)) = decode_data_frame_owned(bytes) {
                             if let Some(tx) = http_bodies.get(&stream_id).map(|entry| entry.value().clone()) {
                                 if tx.send(Ok(bytes::Bytes::from(payload.into_vec()))).await.is_err() {
                                     http_bodies.remove(&stream_id);
-                                    let _ = send_error(&outbound, Some(stream_id), "HTTP_BODY_BACKPRESSURE", "request body channel is full").await;
+                                    let _ = send_error(&outbound, Some(stream_id), "HTTP_BODY_BACKPRESSURE", "请求体接收通道已关闭").await;
                                 }
-                                continue;
+                                return Ok(true);
                             }
 
                             if let Some(tx) =
@@ -279,7 +427,15 @@ async fn handle_socket_result(socket: axum::extract::ws::WebSocket, state: AppSt
                     axum::extract::ws::Message::Ping(_) | axum::extract::ws::Message::Pong(_) => {
                         return Err(anyhow!("received unencrypted websocket control frame"));
                     }
-                    axum::extract::ws::Message::Close(_) => break,
+                    axum::extract::ws::Message::Close(_) => return Ok(false),
+                }
+                Ok(true)
+                }).await;
+                match result {
+                    Ok(false) => break,
+                    Ok(true) => {},
+                    Err(_) if lease.check().is_err() => continue,
+                    Err(error) => return Err(error),
                 }
             }
             else => break,
@@ -372,13 +528,43 @@ fn push_ws_message(
 
 async fn handle_text_message(
     state: &AppState,
+    lease: &Arc<SessionLease>,
     outbound: &Outbound,
     streams: &TcpStreams,
     stream_cancels: &StreamCancels,
     http_bodies: &HttpBodies,
     text: &str,
 ) -> Result<()> {
-    match decode_message(text)? {
+    lease.check()?;
+    let message = decode_message(text)?;
+    let address = match &message {
+        Message::Open { config, .. }
+        | Message::HttpRequest { config, .. }
+        | Message::HttpRequestStart { config, .. } => {
+            match state.authorize_target(lease, config).await {
+                Ok(address) => Some(address),
+                Err(error) => {
+                    let stream_id = match &message {
+                        Message::Open { stream_id, .. }
+                        | Message::HttpRequest { stream_id, .. }
+                        | Message::HttpRequestStart { stream_id, .. } => *stream_id,
+                        _ => unreachable!(),
+                    };
+                    let error = error
+                        .downcast_ref::<GatewayError>()
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            GatewayError::new("TARGET_ERROR", format!("目标地址校验失败：{error}"))
+                        });
+                    send_error(outbound, Some(stream_id), &error.code, &error.message).await?;
+                    return Ok(());
+                }
+            }
+        }
+        _ => None,
+    };
+    lease.check()?;
+    match message {
         Message::Open {
             stream_id,
             target,
@@ -389,7 +575,7 @@ async fn handle_text_message(
                     outbound,
                     Some(stream_id),
                     "MODE_NOT_SUPPORTED",
-                    "target is not tcp",
+                    "目标未配置为 TCP 模式",
                 )
                 .await?;
                 return Ok(());
@@ -401,11 +587,11 @@ async fn handle_text_message(
             tokio::spawn(handle_tcp_stream(
                 stream_id,
                 target,
-                config,
+                address.expect("authorized tcp target"),
+                lease.clone(),
                 outbound.clone(),
                 streams.clone(),
-                stream_cancels.clone(),
-                cancellation,
+                (stream_cancels.clone(), cancellation),
             ));
         }
         Message::HttpRequest {
@@ -419,12 +605,13 @@ async fn handle_text_message(
                     outbound,
                     Some(stream_id),
                     "MODE_NOT_SUPPORTED",
-                    "target is not http",
+                    "目标未配置为 HTTP 模式",
                 )
                 .await?;
                 return Ok(());
             }
             let state = state.clone();
+            let lease = lease.clone();
             let outbound = outbound.clone();
             let cancellation = Arc::new(StreamCancellation::new());
             if let Some(previous) = stream_cancels.insert(stream_id, cancellation.clone()) {
@@ -447,6 +634,7 @@ async fn handle_text_message(
                     let result = handle_http_request(
                         &state,
                         &config,
+                        address.expect("authorized http target"),
                         request_head,
                         body_rx,
                         {
@@ -481,7 +669,7 @@ async fn handle_text_message(
                                     &outbound,
                                     Some(stream_id),
                                     "HTTP_TARGET_ERROR",
-                                    "target response head missing",
+                                    "目标未返回有效的 HTTP 响应头",
                                 )
                                 .await;
                                 return;
@@ -512,6 +700,8 @@ async fn handle_text_message(
                     }
                 };
                 tokio::select! {
+                    biased;
+                    _ = lease.cancelled() => {},
                     _ = cancellation.cancelled() => {}
                     _ = work => {}
                 }
@@ -530,7 +720,7 @@ async fn handle_text_message(
                     outbound,
                     Some(stream_id),
                     "MODE_NOT_SUPPORTED",
-                    "target is not http",
+                    "目标未配置为 HTTP 模式",
                 )
                 .await?;
                 return Ok(());
@@ -539,6 +729,7 @@ async fn handle_text_message(
             let (body_tx, body_rx) = mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
             http_bodies.insert(stream_id, body_tx);
             let state = state.clone();
+            let lease = lease.clone();
             let outbound = outbound.clone();
             let http_bodies = http_bodies.clone();
             let cancellation = Arc::new(StreamCancellation::new());
@@ -551,6 +742,7 @@ async fn handle_text_message(
                     let result = handle_http_request(
                         &state,
                         &config,
+                        address.expect("authorized http target"),
                         request,
                         body_rx,
                         {
@@ -605,6 +797,8 @@ async fn handle_text_message(
                     }
                 };
                 tokio::select! {
+                    biased;
+                    _ = lease.cancelled() => {},
                     _ = cancellation.cancelled() => {}
                     _ = work => {}
                 }
@@ -630,7 +824,9 @@ async fn handle_text_message(
             send_text(outbound, &Message::Pong).await?;
         }
         Message::Pong => {}
-        Message::RegisterAccess { .. }
+        Message::RegisterAccessV3 { .. }
+        | Message::RegisterOkV3 { .. }
+        | Message::RegisterAccess { .. }
         | Message::RegisterOk { .. }
         | Message::OpenOk { .. }
         | Message::Error { .. }

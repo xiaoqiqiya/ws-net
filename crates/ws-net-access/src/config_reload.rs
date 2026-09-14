@@ -26,7 +26,7 @@ pub(crate) async fn watch_access_config(config_path: PathBuf, state: AppState) {
         let modified = match config_modified_at(&config_path) {
             Ok(modified) => modified,
             Err(err) => {
-                warn!(path = %config_path.display(), error = %err, "failed to stat access config");
+                warn!(path = %config_path.display(), error = %err, "无法读取 access 配置文件状态");
                 continue;
             }
         };
@@ -39,9 +39,9 @@ pub(crate) async fn watch_access_config(config_path: PathBuf, state: AppState) {
         sleep(ACCESS_CONFIG_RELOAD_DEBOUNCE).await;
 
         match reload_access_config(&config_path, &state).await {
-            Ok(()) => info!(path = %config_path.display(), "access config reloaded"),
+            Ok(()) => info!(path = %config_path.display(), "配置重新加载成功"),
             Err(err) => {
-                warn!(path = %config_path.display(), error = %err, "failed to reload access config")
+                warn!(path = %config_path.display(), error = %err, "配置重新加载失败，继续使用原配置")
             }
         }
     }
@@ -52,28 +52,31 @@ fn config_modified_at(config_path: &PathBuf) -> Result<SystemTime> {
 }
 
 async fn reload_access_config(config_path: &PathBuf, state: &AppState) -> Result<()> {
-    let config = AccessConfig::load(config_path).context("load access config")?;
-    let connections = connect_all_registered(&config).await?;
+    let config = AccessConfig::load(config_path).context("加载 access 配置失败")?;
     let default_server_url = default_server_url(&config);
 
     let current_config = state.config.read().await;
+    let mut effective_config = config.clone();
     for listener in &current_config.listeners {
-        let updated_listener = config
+        if !config
             .listeners
             .iter()
-            .find(|candidate| candidate.name == listener.name)
-            .unwrap_or(listener);
-        connections
-            .for_listener(updated_listener, default_server_url.as_deref())
-            .with_context(|| format!("validate listener '{}' gateway", listener.name))?;
+            .any(|candidate| candidate.name == listener.name)
+        {
+            effective_config.listeners.push(listener.clone());
+        }
     }
     drop(current_config);
+    // Existing listeners keep their original route if removed from the file.
+    // Reject a broken fallback before spawning replacement connections.
+    effective_config.gateway_configs()?;
+    let connections = connect_all_registered(&config, &state.runtime).await?;
 
     let old_connections = {
         let mut current_connections = state.connections.write().await;
         std::mem::replace(&mut *current_connections, connections)
     };
-    stop_gateway_connections(&old_connections, "access config reloaded").await;
+    stop_gateway_connections(&old_connections, "access 配置已重新加载").await;
 
     *state.config.write().await = config;
     *state.default_server_url.write().await = default_server_url;

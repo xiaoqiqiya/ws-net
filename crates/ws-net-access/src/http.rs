@@ -23,14 +23,14 @@ use tokio::{
     sync::{mpsc, oneshot},
 };
 use tokio_rustls::TlsAcceptor;
-use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, warn};
-use ws_net_common::{encode_data_frame, HttpRequestHead, ListenerConfig, Message};
+use ws_net_common::{encode_data_frame, GatewayError, HttpRequestHead, ListenerConfig, Message};
 
 use crate::{
     app::{current_listener, AppState},
     gateway::{
-        ensure_gateway_ready, is_gateway_disconnected_error, next_stream_id, send_binary, send_text,
+        ensure_gateway_ready, gateway_closed, is_gateway_disconnected_error, next_stream_id,
+        send_binary, send_text,
     },
 };
 
@@ -54,15 +54,15 @@ pub(crate) async fn run_http_listener(state: AppState, listener: ListenerConfig)
     if listener.local_scheme.as_deref() == Some("https") {
         if !listener.auto_cert {
             return Err(anyhow!(
-                "listener '{}' uses local_scheme=https but auto_cert is false",
+                "监听器“{}”使用 HTTPS，必须开启 auto_cert",
                 listener.name
             ));
         }
 
-        info!(name = %listener.name, listen = %listener.listen, host = %listener.host, target = %listener.host, port = listener.port, "https listener started with in-memory self-signed certificate");
+        info!(name = %listener.name, listen = %listener.listen, host = %listener.host, target = %listener.host, port = listener.port, "HTTPS 监听器已启动，使用内存自签名证书");
         serve_https_listener(tcp_listener, app, &listener.host).await?;
     } else {
-        info!(name = %listener.name, listen = %listener.listen, target = %listener.host, port = listener.port, "http listener started");
+        info!(name = %listener.name, listen = %listener.listen, target = %listener.host, port = listener.port, "HTTP 监听器已启动");
         axum::serve(tcp_listener, app).await?;
     }
 
@@ -81,14 +81,14 @@ async fn serve_https_listener(tcp_listener: TcpListener, app: Router, host: &str
 
         tokio::spawn(async move {
             if let Err(err) = reject_plain_http_on_https(&mut socket, &host).await {
-                warn!(peer = %peer, error = %err, "failed to reject plain http on https listener");
+                warn!(peer = %peer, error = %err, "HTTPS 监听器收到不合法连接");
                 return;
             }
 
             let tls_stream = match tls_acceptor.accept(socket).await {
                 Ok(stream) => stream,
                 Err(err) => {
-                    warn!(peer = %peer, error = %err, "tls handshake failed");
+                    warn!(peer = %peer, error = %err, "TLS 握手失败");
                     return;
                 }
             };
@@ -99,7 +99,7 @@ async fn serve_https_listener(tcp_listener: TcpListener, app: Router, host: &str
                 .serve_connection(io, service)
                 .await
             {
-                warn!(peer = %peer, error = %err, "https connection failed");
+                warn!(peer = %peer, error = %err, "HTTPS 连接处理失败");
             }
         });
     }
@@ -113,10 +113,10 @@ async fn reject_plain_http_on_https(socket: &mut TcpStream, host: &str) -> Resul
     }
 
     let response = format!(
-        "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\nThis listener expects HTTPS. Open https://{host}/ instead of http://{host}/.\r\n"
+        "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n此监听器仅支持 HTTPS，请使用 https://{host}/ 访问。\r\n"
     );
     socket.write_all(response.as_bytes()).await?;
-    Err(anyhow!("plain HTTP request received on HTTPS listener"))
+    Err(anyhow!("HTTPS 监听器收到明文 HTTP 请求"))
 }
 
 fn self_signed_tls_config(host: &str) -> Result<rustls::ServerConfig> {
@@ -145,18 +145,28 @@ async fn handle_http_request(
     match handle_http_request_result(state, request).await {
         Ok(response) => response,
         Err(err) => {
+            if let Some(error) = err.downcast_ref::<GatewayError>() {
+                return Response::builder()
+                    .status(error.http_status())
+                    .header("content-type", "text/plain; charset=utf-8")
+                    .header("connection", "close")
+                    .body(Body::from(error.message.clone()))
+                    .unwrap();
+            }
             if is_gateway_disconnected_error(&err) {
                 return Response::builder()
                     .status(StatusCode::SERVICE_UNAVAILABLE)
                     .header("connection", "close")
-                    .body(Body::from("gateway disconnected"))
+                    .header("content-type", "text/plain; charset=utf-8")
+                    .body(Body::from("网关连接已断开，请检查网络或服务状态。"))
                     .unwrap();
             }
 
-            error!(error = %err, "http proxy request failed");
+            error!(error = %err, "HTTP 代理请求失败");
             Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
-                .body(Body::from(format!("gateway request failed: {err}")))
+                .header("content-type", "text/plain; charset=utf-8")
+                .body(Body::from(format!("网关请求失败：{err}")))
                 .unwrap()
         }
     }
@@ -197,7 +207,7 @@ async fn handle_http_request_result(
 
     let target = listener.target_name();
     let target_config = listener.target_config();
-    let (head_tx, head_rx) = oneshot::channel();
+    let (head_tx, mut head_rx) = oneshot::channel();
     let (body_tx, body_rx) = mpsc::channel(64);
     connection.http_head_waiters.insert(stream_id, head_tx);
     connection.http_body_streams.insert(stream_id, body_tx);
@@ -218,49 +228,64 @@ async fn handle_http_request_result(
         return Err(err);
     }
 
-    let mut body_stream = body.into_data_stream();
-    while let Some(chunk) = body_stream.next().await {
-        let chunk = match chunk {
-            Ok(chunk) => chunk,
-            Err(err) => {
-                connection.http_head_waiters.remove(&stream_id);
-                connection.http_body_streams.remove(&stream_id);
-                let _ = send_text(
-                    &connection,
-                    &Message::Close {
-                        stream_id,
-                        reason: "request_body_read_failed".to_string(),
-                    },
-                )
-                .await;
-                return Err(err.into());
-            }
-        };
-        if !chunk.is_empty() {
-            if let Err(err) = send_binary(&connection, encode_data_frame(stream_id, &chunk)).await {
-                connection.http_head_waiters.remove(&stream_id);
-                connection.http_body_streams.remove(&stream_id);
-                let _ = send_text(
-                    &connection,
-                    &Message::Close {
-                        stream_id,
-                        reason: "request_body_send_failed".to_string(),
-                    },
-                )
-                .await;
-                return Err(err);
+    let upload = async {
+        let mut body_stream = body.into_data_stream();
+        while let Some(chunk) = body_stream.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(err) => {
+                    connection.http_head_waiters.remove(&stream_id);
+                    connection.http_body_streams.remove(&stream_id);
+                    let _ = send_text(
+                        &connection,
+                        &Message::Close {
+                            stream_id,
+                            reason: "request_body_read_failed".to_string(),
+                        },
+                    )
+                    .await;
+                    return Err(err.into());
+                }
+            };
+            if !chunk.is_empty() {
+                if let Err(err) =
+                    send_binary(&connection, encode_data_frame(stream_id, &chunk)).await
+                {
+                    connection.http_head_waiters.remove(&stream_id);
+                    connection.http_body_streams.remove(&stream_id);
+                    let _ = send_text(
+                        &connection,
+                        &Message::Close {
+                            stream_id,
+                            reason: "request_body_send_failed".to_string(),
+                        },
+                    )
+                    .await;
+                    return Err(err);
+                }
             }
         }
-    }
-    if let Err(err) = send_text(&connection, &Message::HttpRequestEnd { stream_id }).await {
-        connection.http_head_waiters.remove(&stream_id);
-        connection.http_body_streams.remove(&stream_id);
-        return Err(err);
-    }
+        if let Err(err) = send_text(&connection, &Message::HttpRequestEnd { stream_id }).await {
+            connection.http_head_waiters.remove(&stream_id);
+            connection.http_body_streams.remove(&stream_id);
+            return Err(err);
+        }
+        Ok::<_, anyhow::Error>(())
+    };
+    tokio::pin!(upload);
 
-    let response = match head_rx.await? {
+    let response = tokio::select! {
+        biased;
+        response = &mut head_rx => response?,
+        result = &mut upload => { result?; head_rx.await? },
+    };
+    let response = match response {
         Ok(response) => response,
-        Err(err) => return Err(anyhow!("gateway error {err}")),
+        Err(err) => {
+            connection.http_head_waiters.remove(&stream_id);
+            connection.http_body_streams.remove(&stream_id);
+            return Err(err.into());
+        }
     };
 
     let mut builder = Response::builder().status(response.status);
@@ -278,7 +303,18 @@ async fn handle_http_request_result(
             builder = builder.header(name, value);
         }
     }
-    let body = Body::from_stream(ReceiverStream::new(body_rx));
+    let body = futures_util::stream::unfold(
+        Some((body_rx, connection.clone())),
+        |state| async move {
+            let (mut receiver, connection) = state?;
+            tokio::select! {
+                biased;
+                error = gateway_closed(&connection) => Some((Err(std::io::Error::other(error)), None)),
+                chunk = receiver.recv() => chunk.map(|chunk| (chunk, Some((receiver, connection)))),
+            }
+        },
+    );
+    let body = Body::from_stream(body);
     Ok(builder.body(body)?)
 }
 

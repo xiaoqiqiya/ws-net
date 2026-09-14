@@ -9,13 +9,13 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 use ws_net_common::{
-    new_data_frame_buffer, DataFramePayload, ListenerConfig, Message, StreamId,
+    new_data_frame_buffer, DataFramePayload, GatewayError, ListenerConfig, Message, StreamId,
     DATA_FRAME_HEADER_LEN,
 };
 
 use crate::{
     app::{current_listener, AppState},
-    gateway::{ensure_gateway_ready, next_stream_id, send_binary, send_text},
+    gateway::{ensure_gateway_ready, gateway_closed, next_stream_id, send_binary, send_text},
 };
 
 const TCP_BUFFER_SIZE: usize = 64 * 1024;
@@ -25,7 +25,7 @@ const TCP_SLOW_IO: Duration = Duration::from_millis(20);
 
 pub(crate) async fn run_tcp_listener(state: AppState, listener: ListenerConfig) -> Result<()> {
     let tcp_listener = TcpListener::bind(&listener.listen).await?;
-    info!(name = %listener.name, listen = %listener.listen, target = %listener.host, port = listener.port, "tcp listener started");
+    info!(name = %listener.name, listen = %listener.listen, target = %listener.host, port = listener.port, "TCP 监听器已启动");
 
     loop {
         let (socket, peer) = tcp_listener.accept().await?;
@@ -33,7 +33,12 @@ pub(crate) async fn run_tcp_listener(state: AppState, listener: ListenerConfig) 
         let listener = listener.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_tcp_connection(state, listener, socket).await {
-                warn!(peer = %peer, error = %err, "tcp connection ended");
+                if !err
+                    .downcast_ref::<GatewayError>()
+                    .is_some_and(|error| error.terminal())
+                {
+                    warn!(peer = %peer, error = %err, "TCP 连接结束");
+                }
             }
         });
     }
@@ -58,7 +63,7 @@ async fn handle_tcp_connection(
         listener = %listener.name,
         gateway = %connection.server_url,
         elapsed_ms = session_started.elapsed().as_millis(),
-        "tcp session accepted"
+        "已接受 TCP 连接"
     );
 
     let gateway_ready_started = Instant::now();
@@ -68,7 +73,7 @@ async fn handle_tcp_connection(
         listener = %listener.name,
         elapsed_ms = session_started.elapsed().as_millis(),
         gateway_ready_wait_ms = gateway_ready_started.elapsed().as_millis(),
-        "tcp gateway ready"
+        "TCP 所用网关已就绪"
     );
 
     let target = listener.target_name();
@@ -100,7 +105,7 @@ async fn handle_tcp_connection(
         listener = %listener.name,
         elapsed_ms = session_started.elapsed().as_millis(),
         open_queue_ms = open_send_started.elapsed().as_millis(),
-        "tcp OPEN queued"
+        "TCP 建连请求已发送"
     );
 
     let open_wait_started = Instant::now();
@@ -108,11 +113,11 @@ async fn handle_tcp_connection(
         Ok(Ok(Ok(()))) => {}
         Ok(Ok(Err(err))) => {
             connection.tcp_streams.remove(&stream_id);
-            return Err(anyhow!("gateway error {err}"));
+            return Err(err.into());
         }
         Ok(Err(_)) => {
             connection.tcp_streams.remove(&stream_id);
-            return Err(anyhow!("gateway open waiter canceled"));
+            return Err(anyhow!("网关建连等待已取消"));
         }
         Err(_) => {
             connection.open_waiters.remove(&stream_id);
@@ -125,7 +130,7 @@ async fn handle_tcp_connection(
                 },
             )
             .await;
-            return Err(anyhow!("gateway open timeout"));
+            return Err(anyhow!("等待网关建立目标连接超时"));
         }
     }
 
@@ -134,7 +139,7 @@ async fn handle_tcp_connection(
         listener = %listener.name,
         elapsed_ms = session_started.elapsed().as_millis(),
         open_wait_ms = open_wait_started.elapsed().as_millis(),
-        "tcp OPEN_OK received; forwarding started"
+        "目标 TCP 连接建立成功，开始转发"
     );
 
     let (mut local_read, mut local_write) = socket.into_split();
@@ -147,90 +152,94 @@ async fn handle_tcp_connection(
     let mut max_gateway_queue_ms = 0_u128;
     let mut max_local_write_ms = 0_u128;
 
-    let result: Result<()> = async {
+    let forwarding = async {
         loop {
-        tokio::select! {
-            read = read_data_frame(&mut local_read, stream_id), if !local_read_closed => {
-                let frame = read?;
-                let Some(frame) = frame else {
-                    local_read_closed = true;
-                    let _ = send_text(&connection, &Message::TcpEof { stream_id }).await;
-                    if remote_closed {
-                        break;
+            tokio::select! {
+                read = read_data_frame(&mut local_read, stream_id), if !local_read_closed => {
+                    let frame = read?;
+                    let Some(frame) = frame else {
+                        local_read_closed = true;
+                        let _ = send_text(&connection, &Message::TcpEof { stream_id }).await;
+                        if remote_closed {
+                            break;
+                        }
+                        continue;
+                    };
+                    local_frame_count += 1;
+                    let bytes = frame.len().saturating_sub(DATA_FRAME_HEADER_LEN);
+                    local_bytes += bytes as u64;
+                    let queue_started = Instant::now();
+                    send_binary(&connection, frame).await?;
+                    let queue_elapsed = queue_started.elapsed();
+                    max_gateway_queue_ms = max_gateway_queue_ms.max(queue_elapsed.as_millis());
+                    if queue_elapsed >= TCP_SLOW_IO {
+                        warn!(
+                            stream_id,
+                            listener = %listener.name,
+                            queue_ms = queue_elapsed.as_millis(),
+                            bytes,
+                            "本地数据发送到网关耗时较长"
+                        );
                     }
-                    continue;
-                };
-                local_frame_count += 1;
-                let bytes = frame.len().saturating_sub(DATA_FRAME_HEADER_LEN);
-                local_bytes += bytes as u64;
-                let queue_started = Instant::now();
-                send_binary(&connection, frame).await?;
-                let queue_elapsed = queue_started.elapsed();
-                max_gateway_queue_ms = max_gateway_queue_ms.max(queue_elapsed.as_millis());
-                if queue_elapsed >= TCP_SLOW_IO {
-                    warn!(
+                    debug!(
                         stream_id,
                         listener = %listener.name,
-                        queue_ms = queue_elapsed.as_millis(),
+                        direction = "local_to_gateway",
+                        frame = local_frame_count,
                         bytes,
-                        "slow local-to-gateway channel send"
+                        elapsed_ms = session_started.elapsed().as_millis(),
+                        queue_ms = queue_elapsed.as_millis(),
+                        "TCP 数据已转发"
                     );
                 }
-                debug!(
-                    stream_id,
-                    listener = %listener.name,
-                    direction = "local_to_gateway",
-                    frame = local_frame_count,
-                    bytes,
-                    elapsed_ms = session_started.elapsed().as_millis(),
-                    queue_ms = queue_elapsed.as_millis(),
-                    "tcp data forwarded"
-                );
-            }
-            bytes = write_rx.recv(), if !remote_closed => {
-                let Some(bytes) = bytes else {
-                    info!(stream_id, listener = %listener.name, "tcp stream remote side closed");
-                    remote_closed = true;
-                    local_write.shutdown().await?;
-                    if local_read_closed {
-                        break;
+                bytes = write_rx.recv(), if !remote_closed => {
+                    let Some(bytes) = bytes else {
+                        info!(stream_id, listener = %listener.name, "TCP 远端已关闭发送方向");
+                        remote_closed = true;
+                        local_write.shutdown().await?;
+                        if local_read_closed {
+                            break;
+                        }
+                        continue;
+                    };
+                    remote_frame_count += 1;
+                    let bytes_len = bytes.as_slice().len();
+                    remote_bytes += bytes_len as u64;
+                    let write_started = Instant::now();
+                    local_write.write_all(bytes.as_slice()).await?;
+                    let write_elapsed = write_started.elapsed();
+                    max_local_write_ms = max_local_write_ms.max(write_elapsed.as_millis());
+                    if write_elapsed >= TCP_SLOW_IO {
+                        warn!(
+                            stream_id,
+                            listener = %listener.name,
+                            local_write_ms = write_elapsed.as_millis(),
+                            bytes = bytes_len,
+                            "网关数据写入本地 TCP 耗时较长"
+                        );
                     }
-                    continue;
-                };
-                remote_frame_count += 1;
-                let bytes_len = bytes.as_slice().len();
-                remote_bytes += bytes_len as u64;
-                let write_started = Instant::now();
-                local_write.write_all(bytes.as_slice()).await?;
-                let write_elapsed = write_started.elapsed();
-                max_local_write_ms = max_local_write_ms.max(write_elapsed.as_millis());
-                if write_elapsed >= TCP_SLOW_IO {
-                    warn!(
+                    debug!(
                         stream_id,
                         listener = %listener.name,
-                        local_write_ms = write_elapsed.as_millis(),
+                        direction = "gateway_to_local",
+                        frame = remote_frame_count,
                         bytes = bytes_len,
-                        "slow gateway-to-local tcp write"
+                        elapsed_ms = session_started.elapsed().as_millis(),
+                        local_write_ms = write_elapsed.as_millis(),
+                        "TCP 数据已转发"
                     );
                 }
-                debug!(
-                    stream_id,
-                    listener = %listener.name,
-                    direction = "gateway_to_local",
-                    frame = remote_frame_count,
-                    bytes = bytes_len,
-                    elapsed_ms = session_started.elapsed().as_millis(),
-                    local_write_ms = write_elapsed.as_millis(),
-                    "tcp data forwarded"
-                );
+                else => break,
             }
-            else => break,
         }
-    }
 
         Ok(())
-    }
-    .await;
+    };
+    let result: Result<()> = tokio::select! {
+        biased;
+        error = gateway_closed(&connection) => Err(error.into()),
+        result = forwarding => result,
+    };
 
     connection.tcp_streams.remove(&stream_id);
     info!(
@@ -244,7 +253,7 @@ async fn handle_tcp_connection(
         max_gateway_queue_ms,
         max_local_write_ms,
         ok = result.is_ok(),
-        "tcp session forwarding ended"
+        "TCP 会话转发结束"
     );
     let _ = send_text(
         &connection,

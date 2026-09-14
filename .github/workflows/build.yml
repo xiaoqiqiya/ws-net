@@ -64,11 +64,20 @@ jobs:
         if: runner.os == 'Windows'
         run: cargo build --workspace --release
 
+      - name: Verify native user token system
+        if: runner.os == 'Windows' || matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          cargo fmt --all -- --check
+          cargo build --workspace
+          cargo test --workspace
+          cargo clippy --workspace --all-targets -- -D warnings
+
       - name: Prepare dist linux
         if: runner.os == 'Linux'
         run: |
           mkdir -p dist
           cp target/${{ matrix.target }}/release/ws-net-gateway dist/
+          cp target/${{ matrix.target }}/release/gateway dist/
           cp target/${{ matrix.target }}/release/ws-net-access dist/
           cp gateway.example.toml dist/
           cp access.example.toml dist/
@@ -79,6 +88,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target/release/ws-net-gateway.exe dist/
+          Copy-Item target/release/gateway.exe dist/
           Copy-Item target/release/ws-net-access.exe dist/
           Copy-Item gateway.example.toml dist/
           Copy-Item access.example.toml dist/

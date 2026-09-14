@@ -1,8 +1,8 @@
-use std::io;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex, Weak,
 };
+use std::{collections::HashMap, io};
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
@@ -10,7 +10,8 @@ use dashmap::DashMap;
 use tokio::sync::{mpsc, oneshot, Notify, RwLock};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use ws_net_common::{
-    AccessConfig, DataFramePayload, HttpResponseHead, HttpResponsePayload, ListenerConfig, StreamId,
+    credential_id, random_id, AccessConfig, DataFramePayload, GatewayError, HttpResponseHead,
+    HttpResponsePayload, ListenerConfig, StreamId,
 };
 
 #[derive(Clone)]
@@ -18,10 +19,71 @@ pub(crate) struct AppState {
     pub(crate) config: Arc<RwLock<AccessConfig>>,
     pub(crate) default_server_url: Arc<RwLock<Option<String>>>,
     pub(crate) connections: Arc<RwLock<Arc<GatewayConnections>>>,
+    pub(crate) runtime: Arc<AccessRuntime>,
+}
+
+pub(crate) struct AccessRuntime {
+    pub(crate) instance_id: String,
+    identities: Mutex<HashMap<(String, String), Arc<AccessIdentity>>>,
+}
+
+pub(crate) struct AccessIdentity {
+    pub(crate) blocked: Mutex<Option<GatewayError>>,
+    pub(crate) changed: Notify,
+    pub(crate) connections: Mutex<Vec<Weak<GatewayConnection>>>,
+}
+
+impl AccessRuntime {
+    pub(crate) fn new() -> Result<Arc<Self>> {
+        Ok(Arc::new(Self {
+            instance_id: random_id()?,
+            identities: Mutex::new(HashMap::new()),
+        }))
+    }
+
+    pub(crate) fn identity(&self, server_url: &str, token: &str) -> Result<Arc<AccessIdentity>> {
+        let url = url::Url::parse(server_url).map_err(|_| anyhow!("网关地址格式错误"))?;
+        if !matches!(url.scheme(), "ws" | "wss") || url.host_str().is_none() {
+            return Err(anyhow!("网关地址必须使用 ws 或 wss，并包含主机地址"));
+        }
+        let key = (url.to_string(), credential_id(token));
+        Ok(self
+            .identities
+            .lock()
+            .expect("identity registry poisoned")
+            .entry(key)
+            .or_insert_with(|| {
+                Arc::new(AccessIdentity {
+                    blocked: Mutex::new(None),
+                    changed: Notify::new(),
+                    connections: Mutex::new(Vec::new()),
+                })
+            })
+            .clone())
+    }
+}
+
+impl AccessIdentity {
+    pub(crate) fn error(&self) -> Option<GatewayError> {
+        self.blocked.lock().expect("identity lock poisoned").clone()
+    }
+
+    pub(crate) async fn cancelled(&self) -> GatewayError {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(error) = self.error() {
+                return error;
+            }
+            notified.await;
+        }
+    }
 }
 
 pub(crate) struct GatewayConnection {
     pub(crate) server_url: String,
+    pub(crate) identity: Arc<AccessIdentity>,
     pub(crate) outbound: mpsc::Sender<WsMessage>,
     pub(crate) closed: AtomicBool,
     pub(crate) stopped: AtomicBool,
@@ -30,11 +92,11 @@ pub(crate) struct GatewayConnection {
     pub(crate) connected: Notify,
     pub(crate) stream_ids: AtomicU64,
     pub(crate) tcp_streams: DashMap<StreamId, mpsc::Sender<DataFramePayload>>,
-    pub(crate) open_waiters: DashMap<StreamId, oneshot::Sender<Result<(), String>>>,
+    pub(crate) open_waiters: DashMap<StreamId, oneshot::Sender<Result<(), GatewayError>>>,
     pub(crate) http_waiters:
-        DashMap<StreamId, oneshot::Sender<Result<HttpResponsePayload, String>>>,
+        DashMap<StreamId, oneshot::Sender<Result<HttpResponsePayload, GatewayError>>>,
     pub(crate) http_head_waiters:
-        DashMap<StreamId, oneshot::Sender<Result<HttpResponseHead, String>>>,
+        DashMap<StreamId, oneshot::Sender<Result<HttpResponseHead, GatewayError>>>,
     pub(crate) http_body_streams: DashMap<StreamId, mpsc::Sender<Result<Bytes, io::Error>>>,
     pub(crate) unknown_streams: DashMap<StreamId, ()>,
 }
@@ -53,7 +115,7 @@ pub(crate) struct GatewayConnectionPool {
 impl GatewayConnections {
     pub(crate) fn new(pools: Vec<GatewayConnectionPool>) -> Result<Self> {
         if pools.is_empty() {
-            return Err(anyhow!("no gateway connection pools available"));
+            return Err(anyhow!("没有可用的网关连接池"));
         }
 
         Ok(Self { pools })
@@ -77,7 +139,7 @@ impl GatewayConnections {
 
         if gateway_name.is_some() && listener_server_url.is_some() {
             return Err(anyhow!(
-                "listener '{}' must not set both gateway and server_url",
+                "监听器“{}”不能同时配置 gateway 和 server_url",
                 listener.name
             ));
         }
@@ -92,7 +154,7 @@ impl GatewayConnections {
                 .map(GatewayConnectionPool::next_connection)
                 .ok_or_else(|| {
                     anyhow!(
-                        "listener '{}' references unavailable gateway '{}'",
+                        "监听器“{}”引用了不存在的网关“{}”",
                         listener.name,
                         gateway_name
                     )
@@ -104,14 +166,14 @@ impl GatewayConnections {
                 .map(GatewayConnectionPool::next_connection)
                 .ok_or_else(|| {
                     anyhow!(
-                        "listener '{}' references unavailable gateway '{}'",
+                        "监听器“{}”引用了不存在的网关“{}”",
                         listener.name,
                         server_url
                     )
                 }),
             (None, None, [pool]) => Ok(pool.next_connection()),
             (None, None, _) => Err(anyhow!(
-                "listener '{}' must set gateway or server_url",
+                "监听器“{}”必须指定 gateway 或 server_url",
                 listener.name
             )),
         }
@@ -125,7 +187,7 @@ impl GatewayConnectionPool {
         connections: Vec<Arc<GatewayConnection>>,
     ) -> Result<Self> {
         if connections.is_empty() {
-            return Err(anyhow!("gateway pool '{server_url}' has no connections"));
+            return Err(anyhow!("网关连接池“{server_url}”没有连接"));
         }
 
         Ok(Self {
