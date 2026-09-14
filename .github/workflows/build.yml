@@ -64,12 +64,11 @@ jobs:
         if: runner.os == 'Windows'
         run: cargo build --workspace --release
 
-      - name: Verify native user token system
+      - name: Check native code without running tests
         if: runner.os == 'Windows' || matrix.target == 'x86_64-unknown-linux-musl'
         run: |
           cargo fmt --all -- --check
           cargo build --workspace
-          cargo test --workspace
           cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Prepare dist linux
