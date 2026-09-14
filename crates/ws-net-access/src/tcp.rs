@@ -33,11 +33,12 @@ pub(crate) async fn run_tcp_listener(state: AppState, listener: ListenerConfig) 
         let listener = listener.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_tcp_connection(state, listener, socket).await {
-                if !err
-                    .downcast_ref::<GatewayError>()
-                    .is_some_and(|error| error.terminal() || error.code == "FORBIDDEN")
-                {
-                    warn!(peer = %peer, error = %err, "TCP 连接结束");
+                match err.downcast_ref::<GatewayError>() {
+                    Some(error) if error.code == "UNAUTHORIZED" => {
+                        warn!(peer = %peer, code = %error.code, "{}", error.message);
+                    }
+                    Some(error) if error.terminal() || error.code == "FORBIDDEN" => {}
+                    _ => warn!(peer = %peer, error = %err, "TCP 连接结束"),
                 }
             }
         });

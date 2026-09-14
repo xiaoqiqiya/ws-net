@@ -62,6 +62,11 @@ impl Drop for SessionCleanup {
     }
 }
 
+fn reject_handshake(status: StatusCode, error: GatewayError) -> axum::response::Response {
+    warn!(code = %error.code, "{}", error.message);
+    (status, Json(error)).into_response()
+}
+
 pub(crate) async fn ws_entry(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
@@ -69,11 +74,10 @@ pub(crate) async fn ws_entry(
 ) -> axum::response::Response {
     let bootstrap = if let Some(version) = headers.get(PROTOCOL_HEADER) {
         if version != "3" && version != "4" {
-            return (
+            return reject_handshake(
                 StatusCode::BAD_REQUEST,
-                Json(GatewayError::new("PROTOCOL_ERROR", "不支持的隧道协议版本")),
-            )
-                .into_response();
+                GatewayError::new("PROTOCOL_ERROR", "不支持的隧道协议版本"),
+            );
         }
         let id = headers
             .get(CREDENTIAL_HEADER)
@@ -84,7 +88,7 @@ pub(crate) async fn ws_entry(
             .and_then(|value| value.to_str().ok())
             .unwrap_or("");
         if !valid_id(id) || !valid_id(client_nonce) {
-            return (StatusCode::UNAUTHORIZED, Json(GatewayError::unauthorized())).into_response();
+            return reject_handshake(StatusCode::UNAUTHORIZED, GatewayError::unauthorized());
         }
         let dual_protocol = version == "4";
         let gateway_id = if dual_protocol {
@@ -103,7 +107,7 @@ pub(crate) async fn ws_entry(
                         .downcast_ref::<GatewayError>()
                         .cloned()
                         .unwrap_or_else(GatewayError::unauthorized);
-                    return (StatusCode::UNAUTHORIZED, Json(error)).into_response();
+                    return reject_handshake(StatusCode::UNAUTHORIZED, error);
                 }
             };
         let server_nonce = match random_id() {
@@ -118,14 +122,13 @@ pub(crate) async fn ws_entry(
         ) {
             Ok(cipher) => cipher,
             Err(_) => {
-                return (StatusCode::UNAUTHORIZED, Json(GatewayError::unauthorized()))
-                    .into_response()
+                return reject_handshake(StatusCode::UNAUTHORIZED, GatewayError::unauthorized())
             }
         };
         Some((token, user_token, cipher, server_nonce, dual_protocol))
     } else {
         if state.config().auth.enabled {
-            return (StatusCode::UNAUTHORIZED, Json(GatewayError::unauthorized())).into_response();
+            return reject_handshake(StatusCode::UNAUTHORIZED, GatewayError::unauthorized());
         }
         None
     };
@@ -215,13 +218,15 @@ async fn handle_socket_result(
             client_public_key,
         }) if !v3 && submitted == token => (random_id()?, client_public_key),
         _ => {
+            let error = GatewayError::unauthorized();
+            warn!(code = %error.code, "{}", error.message);
             ws_sender
                 .send(encrypt_gateway_message(
                     &bootstrap_cipher,
                     axum::extract::ws::Message::Text(encode_message(&Message::Error {
                         stream_id: None,
-                        code: "UNAUTHORIZED".to_string(),
-                        message: GatewayError::unauthorized().message,
+                        code: error.code,
+                        message: error.message,
                     })?),
                 )?)
                 .await?;
@@ -240,6 +245,7 @@ async fn handle_socket_result(
                     .downcast_ref::<GatewayError>()
                     .cloned()
                     .unwrap_or_else(GatewayError::unauthorized);
+                warn!(code = %error.code, "{}", error.message);
                 ws_sender
                     .send(encrypt_gateway_message(
                         &bootstrap_cipher,

@@ -146,6 +146,9 @@ async fn handle_http_request(
         Ok(response) => response,
         Err(err) => {
             if let Some(error) = err.downcast_ref::<GatewayError>() {
+                if error.code == "UNAUTHORIZED" {
+                    warn!(code = %error.code, "{}", error.message);
+                }
                 return Response::builder()
                     .status(error.http_status())
                     .header("content-type", "text/plain; charset=utf-8")

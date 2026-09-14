@@ -188,6 +188,7 @@ fn stop_identity(connection: &GatewayConnection, error: GatewayError) {
         }
         *blocked = Some(error.clone());
     }
+    warn!(server_url = %connection.server_url, code = %error.code, "{}", error.message);
     identity.changed.notify_waiters();
     let connections: Vec<_> = identity
         .connections
@@ -202,7 +203,6 @@ fn stop_identity(connection: &GatewayConnection, error: GatewayError) {
         connection.connected.notify_waiters();
         close_gateway_connection(&connection, &error.message);
     }
-    warn!(server_url = %connection.server_url, code = %error.code, "{}", error.message);
 }
 
 async fn run_gateway_session(

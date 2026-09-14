@@ -172,13 +172,13 @@ impl AppState {
         if credential_id(&runtime.config.auth.access_token) != gateway_id {
             return Err(GatewayError::new(
                 "UNAUTHORIZED",
-                "网关鉴权失败：gateway Token 无效或已撤销，已停止自动重连。",
+                "未认证：网关鉴权失败，gateway Token 无效或已撤销，连接已拒绝，已停止自动重连。",
             )
             .into());
         }
         let user_token = if runtime.config.auth.enabled {
             Some(runtime.credentials.get(user_id.unwrap_or(""))
-                .ok_or_else(|| GatewayError::new("UNAUTHORIZED", "用户鉴权失败：用户体系已开启，必须提供有效的 user_token，已停止自动重连。"))?
+                .ok_or_else(|| GatewayError::new("UNAUTHORIZED", "未认证：用户鉴权失败，user_token 未配置、无效或已被撤销，连接已拒绝，已停止自动重连。"))?
                 .token.clone())
         } else {
             None
