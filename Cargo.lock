@@ -2147,6 +2147,7 @@ dependencies = [
  "hyper-util",
  "rcgen",
  "rustls",
+ "serde_json",
  "tokio",
  "tokio-rustls",
  "tokio-stream",

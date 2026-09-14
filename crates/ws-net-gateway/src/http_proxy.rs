@@ -71,6 +71,7 @@ pub(crate) async fn handle_http_request(
 
     let response = builder.send().await?;
     let status = response.status().as_u16();
+    tracing::info!(host = %target.host, port = target.port, scheme, status, "目标 HTTP 响应头已接收");
     let mut headers = Vec::new();
     let skip_headers = response_headers_to_skip();
     for (name, value) in response.headers() {
@@ -92,6 +93,7 @@ pub(crate) async fn handle_http_request(
         on_body_chunk(chunk?).await?;
     }
 
+    tracing::info!(host = %target.host, port = target.port, scheme, status, "目标 HTTP 请求处理完成");
     Ok(())
 }
 

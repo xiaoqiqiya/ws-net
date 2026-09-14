@@ -189,6 +189,8 @@ pub struct AccessGatewayConfig {
     pub name: String,
     pub server_url: String,
     pub token: String,
+    #[serde(default)]
+    pub user_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -324,6 +326,7 @@ impl AccessConfig {
                     name: format!("gateway-{}", index + 1),
                     server_url,
                     token: token.to_string(),
+                    user_token: None,
                 })
                 .collect()
         } else {
@@ -349,6 +352,13 @@ impl AccessConfig {
             }
             if gateway.token.trim().is_empty() {
                 bail!("未鉴权：网关“{}”的 Token 不能为空", gateway.name);
+            }
+            if gateway
+                .user_token
+                .as_ref()
+                .is_some_and(|token| token.trim().is_empty())
+            {
+                bail!("未鉴权：网关“{}”的 user_token 不能为空", gateway.name);
             }
         }
 
@@ -504,6 +514,38 @@ mod tests {
     }
 
     #[test]
+    fn named_gateway_user_token_is_optional_and_validated() {
+        let mut config: AccessConfig = toml::from_str(
+            r#"
+            [access]
+            [[gateways]]
+            name = "a"
+            server_url = "ws://a/tunnel"
+            token = "gateway-a"
+            user_token = "same-user"
+            [[gateways]]
+            name = "b"
+            server_url = "ws://b/tunnel"
+            token = "gateway-b"
+            user_token = "same-user"
+        "#,
+        )
+        .unwrap();
+        let gateways = config.gateway_configs().unwrap();
+        assert_ne!(gateways[0].token, gateways[1].token);
+        assert_eq!(gateways[0].user_token.as_deref(), Some("same-user"));
+        assert_eq!(gateways[0].user_token, gateways[1].user_token);
+        config.gateways[0].user_token = None;
+        assert!(config.gateway_configs().unwrap()[0].user_token.is_none());
+        config.gateways[0].user_token = Some(" ".into());
+        assert!(config
+            .gateway_configs()
+            .unwrap_err()
+            .to_string()
+            .contains("user_token"));
+    }
+
+    #[test]
     fn legacy_gateway_and_cross_gateway_same_token_remain_valid() {
         let config: GatewayConfig = toml::from_str(
             r#"
@@ -569,11 +611,13 @@ mod tests {
                     name: "east".to_string(),
                     server_url: "wss://east.example/tunnel".to_string(),
                     token: "east-token".to_string(),
+                    user_token: None,
                 },
                 AccessGatewayConfig {
                     name: "west".to_string(),
                     server_url: "wss://west.example/tunnel".to_string(),
                     token: "west-token".to_string(),
+                    user_token: None,
                 },
             ]
         );

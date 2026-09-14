@@ -22,6 +22,8 @@ pub const MAX_ENCRYPTED_TUNNEL_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
 pub const PROTOCOL_HEADER: &str = "x-ws-net-protocol";
 pub const CREDENTIAL_HEADER: &str = "x-ws-net-credential";
+pub const GATEWAY_CREDENTIAL_HEADER: &str = "x-ws-net-gateway-credential";
+pub const USER_AUTH_HEADER: &str = "x-ws-net-user-auth";
 pub const CLIENT_NONCE_HEADER: &str = "x-ws-net-client-nonce";
 pub const SERVER_NONCE_HEADER: &str = "x-ws-net-server-nonce";
 
@@ -38,6 +40,22 @@ pub fn credential_id(token: &str) -> String {
     context.update(b"ws-net/credential/v3\0");
     context.update(token.as_bytes());
     hex(context.finish().as_ref())
+}
+
+fn token_pair_hash(domain: &[u8], gateway_token: &str, user_token: &str) -> String {
+    let mut context = digest::Context::new(&digest::SHA256);
+    context.update(domain);
+    context.update(&(gateway_token.len() as u64).to_le_bytes());
+    context.update(gateway_token.as_bytes());
+    context.update(user_token.as_bytes());
+    hex(context.finish().as_ref())
+}
+
+pub fn access_credential_id(gateway_token: &str, user_token: Option<&str>) -> String {
+    match user_token {
+        Some(user_token) => token_pair_hash(b"ws-net/identity/v4\0", gateway_token, user_token),
+        None => credential_id(gateway_token),
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -208,6 +226,27 @@ impl EphemeralKeyPair {
 }
 
 impl TunnelCipher {
+    pub fn from_tokens(
+        gateway_token: &str,
+        user_token: Option<&str>,
+        client_nonce: &str,
+        server_nonce: &str,
+    ) -> Result<Self> {
+        if gateway_token.trim().is_empty()
+            || user_token.is_some_and(|token| token.trim().is_empty())
+        {
+            bail!("握手 Token 不能为空");
+        }
+        match user_token {
+            Some(user_token) => Self::from_connection_key(
+                &token_pair_hash(b"ws-net/bootstrap-secret/v4\0", gateway_token, user_token),
+                client_nonce,
+                server_nonce,
+            ),
+            None => Self::from_connection_key(gateway_token, client_nonce, server_nonce),
+        }
+    }
+
     pub fn from_connection_key(
         token: &str,
         client_nonce: &str,
@@ -297,6 +336,38 @@ fn sequence_nonce(prefix: [u8; 4], sequence: u64) -> [u8; 12] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_bootstrap_requires_both_tokens_without_exposing_them() {
+        let client = random_id().unwrap();
+        let server = random_id().unwrap();
+        let sender = TunnelCipher::from_tokens("gateway", Some("user"), &client, &server).unwrap();
+        let frame = sender
+            .encrypt_from_access(TunnelFrameKind::Text, b"protected-register")
+            .unwrap();
+        for (gateway, user) in [
+            ("wrong", Some("user")),
+            ("gateway", Some("wrong")),
+            ("gateway", None),
+        ] {
+            let receiver = TunnelCipher::from_tokens(gateway, user, &client, &server).unwrap();
+            assert!(receiver.decrypt_from_access(frame.clone()).is_err());
+        }
+        let receiver =
+            TunnelCipher::from_tokens("gateway", Some("user"), &client, &server).unwrap();
+        assert_eq!(
+            receiver.decrypt_from_access(frame).unwrap().1,
+            b"protected-register"
+        );
+        assert_ne!(
+            access_credential_id("ab", Some("c")),
+            access_credential_id("a", Some("bc"))
+        );
+        assert_ne!(
+            access_credential_id("gateway", None),
+            access_credential_id("gateway", Some("user"))
+        );
+    }
 
     #[test]
     fn connection_bootstrap_is_unique_authenticated_and_not_a_selector_proof() {

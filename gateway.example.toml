@@ -4,7 +4,7 @@ path = "/tunnel"
 
 [auth]
 access_token = "change-access-token"
-# 新用户体系默认关闭，旧共享 Token 继续生效。
+# 关闭时只验证 gateway Token；开启时同时验证 gateway Token 和用户 Token。
 enabled = false
 # 用户未显式设置 single_access 时继承这里的值。
 single_access = true

@@ -35,7 +35,7 @@ pub(crate) async fn run_tcp_listener(state: AppState, listener: ListenerConfig) 
             if let Err(err) = handle_tcp_connection(state, listener, socket).await {
                 if !err
                     .downcast_ref::<GatewayError>()
-                    .is_some_and(|error| error.terminal())
+                    .is_some_and(|error| error.terminal() || error.code == "FORBIDDEN")
                 {
                     warn!(peer = %peer, error = %err, "TCP 连接结束");
                 }

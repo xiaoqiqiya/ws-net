@@ -10,8 +10,8 @@ use dashmap::DashMap;
 use tokio::sync::{mpsc, oneshot, Notify, RwLock};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use ws_net_common::{
-    credential_id, random_id, AccessConfig, DataFramePayload, GatewayError, HttpResponseHead,
-    HttpResponsePayload, ListenerConfig, StreamId,
+    access_credential_id, random_id, AccessConfig, DataFramePayload, GatewayError,
+    HttpResponseHead, HttpResponsePayload, ListenerConfig, StreamId,
 };
 
 #[derive(Clone)]
@@ -41,12 +41,17 @@ impl AccessRuntime {
         }))
     }
 
-    pub(crate) fn identity(&self, server_url: &str, token: &str) -> Result<Arc<AccessIdentity>> {
+    pub(crate) fn identity(
+        &self,
+        server_url: &str,
+        token: &str,
+        user_token: Option<&str>,
+    ) -> Result<Arc<AccessIdentity>> {
         let url = url::Url::parse(server_url).map_err(|_| anyhow!("网关地址格式错误"))?;
         if !matches!(url.scheme(), "ws" | "wss") || url.host_str().is_none() {
             return Err(anyhow!("网关地址必须使用 ws 或 wss，并包含主机地址"));
         }
-        let key = (url.to_string(), credential_id(token));
+        let key = (url.to_string(), access_credential_id(token, user_token));
         Ok(self
             .identities
             .lock()

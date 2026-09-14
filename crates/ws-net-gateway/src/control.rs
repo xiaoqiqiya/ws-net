@@ -306,6 +306,12 @@ async fn handle(
     } else {
         Err(anyhow!("配置路径与运行实例不匹配"))
     };
+    match &result {
+        Ok(()) => tracing::info!(path = %path.display(), "gateway 配置重新加载成功"),
+        Err(error) => {
+            tracing::warn!(path = %path.display(), error = %error, "gateway 配置重新加载失败，继续使用原配置")
+        }
+    }
     let response = Response {
         ok: result.is_ok(),
         enabled: state.config().auth.enabled,

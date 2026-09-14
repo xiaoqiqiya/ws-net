@@ -14,12 +14,13 @@ use tokio::{
     task::AbortHandle,
     time::{interval, timeout, Instant, MissedTickBehavior},
 };
-use tracing::warn;
+use tracing::{info, warn, Instrument, Span};
 use ws_net_common::{
     decode_data_frame_owned, decode_message, encode_data_frame, encode_message, random_id,
     try_merge_data_frames, valid_id, GatewayError, HttpRequestHead, HttpResponsePayload, Message,
     Mode, TunnelCipher, TunnelFrameKind, CLIENT_NONCE_HEADER, CREDENTIAL_HEADER,
-    DATA_FRAME_HEADER_LEN, MAX_ENCRYPTED_TUNNEL_FRAME_SIZE, PROTOCOL_HEADER, SERVER_NONCE_HEADER,
+    DATA_FRAME_HEADER_LEN, GATEWAY_CREDENTIAL_HEADER, MAX_ENCRYPTED_TUNNEL_FRAME_SIZE,
+    PROTOCOL_HEADER, SERVER_NONCE_HEADER, USER_AUTH_HEADER,
 };
 
 use crate::{
@@ -56,10 +57,7 @@ impl Drop for SessionCleanup {
         self.streams.clear();
         self.http_bodies.clear();
         if canceled_streams > 0 {
-            warn!(
-                canceled_streams,
-                "gateway websocket session ended; canceled remaining tcp streams"
-            );
+            warn!(canceled_streams, "网关隧道会话结束，已取消剩余 TCP 连接");
         }
     }
 }
@@ -70,7 +68,7 @@ pub(crate) async fn ws_entry(
     headers: HeaderMap,
 ) -> axum::response::Response {
     let bootstrap = if let Some(version) = headers.get(PROTOCOL_HEADER) {
-        if version != "3" {
+        if version != "3" && version != "4" {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(GatewayError::new("PROTOCOL_ERROR", "不支持的隧道协议版本")),
@@ -88,39 +86,72 @@ pub(crate) async fn ws_entry(
         if !valid_id(id) || !valid_id(client_nonce) {
             return (StatusCode::UNAUTHORIZED, Json(GatewayError::unauthorized())).into_response();
         }
-        let token = match state.token(id) {
-            Ok(token) => token,
-            Err(_) => {
-                return (StatusCode::UNAUTHORIZED, Json(GatewayError::unauthorized()))
-                    .into_response()
-            }
+        let dual_protocol = version == "4";
+        let gateway_id = if dual_protocol {
+            headers
+                .get(GATEWAY_CREDENTIAL_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+        } else {
+            id
         };
+        let (token, user_token) =
+            match state.bootstrap_tokens(gateway_id, dual_protocol.then_some(id)) {
+                Ok(tokens) => tokens,
+                Err(error) => {
+                    let error = error
+                        .downcast_ref::<GatewayError>()
+                        .cloned()
+                        .unwrap_or_else(GatewayError::unauthorized);
+                    return (StatusCode::UNAUTHORIZED, Json(error)).into_response();
+                }
+            };
         let server_nonce = match random_id() {
             Ok(nonce) => nonce,
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         };
-        let cipher = match TunnelCipher::from_connection_key(&token, client_nonce, &server_nonce) {
+        let cipher = match TunnelCipher::from_tokens(
+            &token,
+            user_token.as_deref(),
+            client_nonce,
+            &server_nonce,
+        ) {
             Ok(cipher) => cipher,
             Err(_) => {
                 return (StatusCode::UNAUTHORIZED, Json(GatewayError::unauthorized()))
                     .into_response()
             }
         };
-        Some((token, cipher, server_nonce))
+        Some((token, user_token, cipher, server_nonce, dual_protocol))
     } else {
+        if state.config().auth.enabled {
+            return (StatusCode::UNAUTHORIZED, Json(GatewayError::unauthorized())).into_response();
+        }
         None
     };
-    let server_nonce = bootstrap.as_ref().map(|(_, _, nonce)| nonce.clone());
+    let server_nonce = bootstrap
+        .as_ref()
+        .map(|(_, user_token, _, nonce, dual)| (nonce.clone(), user_token.is_some(), *dual));
     let mut response = ws
         .max_message_size(MAX_ENCRYPTED_TUNNEL_FRAME_SIZE)
         .max_frame_size(MAX_ENCRYPTED_TUNNEL_FRAME_SIZE)
         .on_upgrade(move |socket| handle_socket(socket, state, bootstrap))
         .into_response();
-    if let Some(nonce) = server_nonce {
+    if let Some((nonce, user_auth, dual)) = server_nonce {
         response.headers_mut().insert(
             SERVER_NONCE_HEADER,
             HeaderValue::from_str(&nonce).expect("hex header"),
         );
+        response.headers_mut().insert(
+            PROTOCOL_HEADER,
+            HeaderValue::from_static(if dual { "4" } else { "3" }),
+        );
+        if dual {
+            response.headers_mut().insert(
+                USER_AUTH_HEADER,
+                HeaderValue::from_static(if user_auth { "true" } else { "false" }),
+            );
+        }
     }
     response
 }
@@ -128,27 +159,42 @@ pub(crate) async fn ws_entry(
 async fn handle_socket(
     socket: axum::extract::ws::WebSocket,
     state: AppState,
-    bootstrap: Option<(String, TunnelCipher, String)>,
+    bootstrap: Option<(String, Option<String>, TunnelCipher, String, bool)>,
 ) {
-    if let Err(err) = handle_socket_result(socket, state, bootstrap).await {
-        warn!(error = %err, "网关隧道会话结束");
+    let span = if bootstrap
+        .as_ref()
+        .is_some_and(|(_, user_token, _, _, _)| user_token.is_some())
+    {
+        // Keep user context available even when only WARN/ERROR events are enabled.
+        tracing::error_span!(parent: None, "access_session", user = tracing::field::Empty)
+    } else {
+        Span::none()
+    };
+    async move {
+        match handle_socket_result(socket, state, bootstrap).await {
+            Ok(()) => info!("网关隧道会话已关闭"),
+            Err(err) => warn!(error = %err, "网关隧道会话结束"),
+        }
     }
+    .instrument(span)
+    .await;
 }
 
 async fn handle_socket_result(
     socket: axum::extract::ws::WebSocket,
     state: AppState,
-    bootstrap: Option<(String, TunnelCipher, String)>,
+    bootstrap: Option<(String, Option<String>, TunnelCipher, String, bool)>,
 ) -> Result<()> {
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
     let v3 = bootstrap.is_some();
-    let (token, bootstrap_cipher) = match bootstrap {
-        Some((token, cipher, _)) => (token, cipher),
+    let dual_protocol = bootstrap.as_ref().is_some_and(|(_, _, _, _, dual)| *dual);
+    let (token, user_token, bootstrap_cipher) = match bootstrap {
+        Some((token, user_token, cipher, _, _)) => (token, user_token, cipher),
         None => {
             let token = state.config().auth.access_token;
             let cipher = TunnelCipher::from_shared_key(&token)?;
-            (token, cipher)
+            (token, None, cipher)
         }
     };
     let Some(Ok(first)) = timeout(Duration::from_secs(10), ws_receiver.next()).await? else {
@@ -156,10 +202,14 @@ async fn handle_socket_result(
     };
 
     let (instance, client_public_key) = match decode_access_message(&bootstrap_cipher, first) {
+        Ok(Message::RegisterAccessV4 {
+            instance_id,
+            client_public_key,
+        }) if dual_protocol => (instance_id, client_public_key),
         Ok(Message::RegisterAccessV3 {
             instance_id,
             client_public_key,
-        }) if v3 => (instance_id, client_public_key),
+        }) if v3 && !dual_protocol => (instance_id, client_public_key),
         Ok(Message::RegisterAccess {
             token: submitted,
             client_public_key,
@@ -182,34 +232,45 @@ async fn handle_socket_result(
     let gateway_public_key = ephemeral_key_pair.public_key().to_vec();
     let cipher = Arc::new(ephemeral_key_pair.derive_session_cipher(&client_public_key)?);
 
-    let (lease, user_name) = match state.register(&token, &instance, !v3) {
-        Ok(registration) => registration,
-        Err(error) => {
-            let error = error
-                .downcast_ref::<GatewayError>()
-                .cloned()
-                .unwrap_or_else(GatewayError::unauthorized);
-            ws_sender
-                .send(encrypt_gateway_message(
-                    &bootstrap_cipher,
-                    axum::extract::ws::Message::Text(encode_message(&Message::Error {
-                        stream_id: None,
-                        code: error.code,
-                        message: error.message,
-                    })?),
-                )?)
-                .await?;
-            return Ok(());
-        }
-    };
+    let (lease, user_name) =
+        match state.register(&token, user_token.as_deref(), &instance, !dual_protocol) {
+            Ok(registration) => registration,
+            Err(error) => {
+                let error = error
+                    .downcast_ref::<GatewayError>()
+                    .cloned()
+                    .unwrap_or_else(GatewayError::unauthorized);
+                ws_sender
+                    .send(encrypt_gateway_message(
+                        &bootstrap_cipher,
+                        axum::extract::ws::Message::Text(encode_message(&Message::Error {
+                            stream_id: None,
+                            code: error.code,
+                            message: error.message,
+                        })?),
+                    )?)
+                    .await?;
+                return Ok(());
+            }
+        };
 
+    if let Some(user_name) = lease.user_name.as_deref() {
+        Span::current().record("user", tracing::field::display(user_name));
+    }
+    info!("客户端鉴权通过");
     let (outbound, mut outbound_rx) = mpsc::channel::<axum::extract::ws::Message>(1024);
     lease
         .run(async {
             ws_sender
                 .send(encrypt_gateway_message(
                     &bootstrap_cipher,
-                    axum::extract::ws::Message::Text(encode_message(&if v3 {
+                    axum::extract::ws::Message::Text(encode_message(&if dual_protocol {
+                        Message::RegisterOkV4 {
+                            gateway_public_key,
+                            user_name,
+                            user_auth: user_token.is_some(),
+                        }
+                    } else if v3 {
                         Message::RegisterOkV3 {
                             gateway_public_key,
                             user_name,
@@ -235,6 +296,7 @@ async fn handle_socket_result(
                     let message = tokio::select! {
                         biased;
                         error = writer_lease.cancelled() => {
+                            warn!(code = %error.code, "{}", error.message);
                             let _ = timeout(Duration::from_secs(1), async {
                                 if let Ok(message) = encode_message(&Message::Error { stream_id: None, code: error.code, message: error.message }) {
                                     if let Ok(frame) = encrypt_gateway_message(&writer_cipher, axum::extract::ws::Message::Text(message)) {
@@ -324,11 +386,11 @@ async fn handle_socket_result(
                     message_count,
                     batch_bytes,
                     flush_ms = flush_elapsed.as_millis(),
-                    "slow gateway websocket batch flush"
+                    "网关隧道批量发送耗时较长"
                 );
             }
         }
-    });
+    }.in_current_span());
 
     let streams: TcpStreams = Arc::new(DashMap::new());
     let stream_cancels: StreamCancels = Arc::new(DashMap::new());
@@ -367,7 +429,7 @@ async fn handle_socket_result(
                 let frame = match frame {
                     Ok(frame) => frame,
                     Err(err) => {
-                        warn!(error = %err, "gateway websocket read failed; ending session");
+                        warn!(error = %err, "网关隧道读取失败，会话即将结束");
                         break;
                     }
                 };
@@ -415,10 +477,10 @@ async fn handle_socket_result(
                                     .await;
                                 }
                             } else {
-                                warn!(stream_id, "received binary frame for unknown stream");
+                                warn!(stream_id, "收到未知业务流的数据");
                             }
                         } else {
-                            warn!(len = frame_len, "received invalid binary frame from access");
+                            warn!(len = frame_len, "收到客户端发送的非法数据帧");
                         }
                     }
                     axum::extract::ws::Message::Text(_) => {
@@ -584,15 +646,18 @@ async fn handle_text_message(
             if let Some(previous) = stream_cancels.insert(stream_id, cancellation.clone()) {
                 previous.cancel();
             }
-            tokio::spawn(handle_tcp_stream(
-                stream_id,
-                target,
-                address.expect("authorized tcp target"),
-                lease.clone(),
-                outbound.clone(),
-                streams.clone(),
-                (stream_cancels.clone(), cancellation),
-            ));
+            tokio::spawn(
+                handle_tcp_stream(
+                    stream_id,
+                    target,
+                    address.expect("authorized tcp target"),
+                    lease.clone(),
+                    outbound.clone(),
+                    streams.clone(),
+                    (stream_cancels.clone(), cancellation),
+                )
+                .in_current_span(),
+            );
         }
         Message::HttpRequest {
             stream_id,
@@ -618,96 +683,99 @@ async fn handle_text_message(
                 previous.cancel();
             }
             let stream_cancels = stream_cancels.clone();
-            tokio::spawn(async move {
-                let work = async {
-                    let request_head = HttpRequestHead {
-                        method: request.method,
-                        path_and_query: request.path_and_query,
-                        headers: request.headers,
-                    };
-                    let (body_tx, body_rx) = mpsc::channel(1);
-                    let _ = body_tx.send(Ok(bytes::Bytes::from(request.body))).await;
-                    drop(body_tx);
+            tokio::spawn(
+                async move {
+                    let work = async {
+                        let request_head = HttpRequestHead {
+                            method: request.method,
+                            path_and_query: request.path_and_query,
+                            headers: request.headers,
+                        };
+                        let (body_tx, body_rx) = mpsc::channel(1);
+                        let _ = body_tx.send(Ok(bytes::Bytes::from(request.body))).await;
+                        drop(body_tx);
 
-                    let response_head = Arc::new(tokio::sync::Mutex::new(None));
-                    let response_body = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-                    let result = handle_http_request(
-                        &state,
-                        &config,
-                        address.expect("authorized http target"),
-                        request_head,
-                        body_rx,
-                        {
-                            let response_head = response_head.clone();
-                            move |response| {
+                        let response_head = Arc::new(tokio::sync::Mutex::new(None));
+                        let response_body = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+                        let result = handle_http_request(
+                            &state,
+                            &config,
+                            address.expect("authorized http target"),
+                            request_head,
+                            body_rx,
+                            {
                                 let response_head = response_head.clone();
-                                async move {
-                                    *response_head.lock().await = Some(response);
-                                    Ok(())
+                                move |response| {
+                                    let response_head = response_head.clone();
+                                    async move {
+                                        *response_head.lock().await = Some(response);
+                                        Ok(())
+                                    }
+                                    .boxed()
                                 }
-                                .boxed()
-                            }
-                        },
-                        {
-                            let response_body = response_body.clone();
-                            move |chunk| {
+                            },
+                            {
                                 let response_body = response_body.clone();
-                                async move {
-                                    response_body.lock().await.extend_from_slice(&chunk);
-                                    Ok(())
+                                move |chunk| {
+                                    let response_body = response_body.clone();
+                                    async move {
+                                        response_body.lock().await.extend_from_slice(&chunk);
+                                        Ok(())
+                                    }
+                                    .boxed()
                                 }
-                                .boxed()
-                            }
-                        },
-                    )
-                    .await;
+                            },
+                        )
+                        .await;
 
-                    match result {
-                        Ok(()) => {
-                            let Some(head) = response_head.lock().await.take() else {
+                        match result {
+                            Ok(()) => {
+                                let Some(head) = response_head.lock().await.take() else {
+                                    let _ = send_error(
+                                        &outbound,
+                                        Some(stream_id),
+                                        "HTTP_TARGET_ERROR",
+                                        "目标未返回有效的 HTTP 响应头",
+                                    )
+                                    .await;
+                                    return;
+                                };
+                                let response = HttpResponsePayload {
+                                    status: head.status,
+                                    headers: head.headers,
+                                    body: response_body.lock().await.clone(),
+                                };
+                                let _ = send_text(
+                                    &outbound,
+                                    &Message::HttpResponse {
+                                        stream_id,
+                                        response,
+                                    },
+                                )
+                                .await;
+                            }
+                            Err(err) => {
                                 let _ = send_error(
                                     &outbound,
                                     Some(stream_id),
                                     "HTTP_TARGET_ERROR",
-                                    "目标未返回有效的 HTTP 响应头",
+                                    &format_error_chain(&err),
                                 )
                                 .await;
-                                return;
-                            };
-                            let response = HttpResponsePayload {
-                                status: head.status,
-                                headers: head.headers,
-                                body: response_body.lock().await.clone(),
-                            };
-                            let _ = send_text(
-                                &outbound,
-                                &Message::HttpResponse {
-                                    stream_id,
-                                    response,
-                                },
-                            )
-                            .await;
+                            }
                         }
-                        Err(err) => {
-                            let _ = send_error(
-                                &outbound,
-                                Some(stream_id),
-                                "HTTP_TARGET_ERROR",
-                                &format_error_chain(&err),
-                            )
-                            .await;
-                        }
+                    };
+                    tokio::select! {
+                        biased;
+                        _ = lease.cancelled() => {},
+                        _ = cancellation.cancelled() => {}
+                        _ = work => {}
                     }
-                };
-                tokio::select! {
-                    biased;
-                    _ = lease.cancelled() => {},
-                    _ = cancellation.cancelled() => {}
-                    _ = work => {}
+                    stream_cancels
+                        .remove_if(&stream_id, |_, current| Arc::ptr_eq(current, &cancellation));
                 }
-                stream_cancels
-                    .remove_if(&stream_id, |_, current| Arc::ptr_eq(current, &cancellation));
-            });
+                .in_current_span(),
+            );
         }
         Message::HttpRequestStart {
             stream_id,
@@ -737,75 +805,79 @@ async fn handle_text_message(
                 previous.cancel();
             }
             let stream_cancels = stream_cancels.clone();
-            tokio::spawn(async move {
-                let work = async {
-                    let result = handle_http_request(
-                        &state,
-                        &config,
-                        address.expect("authorized http target"),
-                        request,
-                        body_rx,
-                        {
-                            let outbound = outbound.clone();
-                            move |response| {
+            tokio::spawn(
+                async move {
+                    let work = async {
+                        let result = handle_http_request(
+                            &state,
+                            &config,
+                            address.expect("authorized http target"),
+                            request,
+                            body_rx,
+                            {
                                 let outbound = outbound.clone();
-                                async move {
-                                    send_text(
-                                        &outbound,
-                                        &Message::HttpResponseStart {
-                                            stream_id,
-                                            response,
-                                        },
-                                    )
-                                    .await
+                                move |response| {
+                                    let outbound = outbound.clone();
+                                    async move {
+                                        send_text(
+                                            &outbound,
+                                            &Message::HttpResponseStart {
+                                                stream_id,
+                                                response,
+                                            },
+                                        )
+                                        .await
+                                    }
+                                    .boxed()
                                 }
-                                .boxed()
-                            }
-                        },
-                        {
-                            let outbound = outbound.clone();
-                            move |chunk| {
+                            },
+                            {
                                 let outbound = outbound.clone();
-                                async move {
-                                    outbound
-                                        .send(axum::extract::ws::Message::Binary(
-                                            encode_data_frame(stream_id, &chunk),
-                                        ))
-                                        .await?;
-                                    Ok(())
+                                move |chunk| {
+                                    let outbound = outbound.clone();
+                                    async move {
+                                        outbound
+                                            .send(axum::extract::ws::Message::Binary(
+                                                encode_data_frame(stream_id, &chunk),
+                                            ))
+                                            .await?;
+                                        Ok(())
+                                    }
+                                    .boxed()
                                 }
-                                .boxed()
+                            },
+                        )
+                        .await;
+                        http_bodies.remove(&stream_id);
+                        match result {
+                            Ok(()) => {
+                                let _ =
+                                    send_text(&outbound, &Message::HttpResponseEnd { stream_id })
+                                        .await;
                             }
-                        },
-                    )
-                    .await;
-                    http_bodies.remove(&stream_id);
-                    match result {
-                        Ok(()) => {
-                            let _ =
-                                send_text(&outbound, &Message::HttpResponseEnd { stream_id }).await;
+                            Err(err) => {
+                                let _ = send_error(
+                                    &outbound,
+                                    Some(stream_id),
+                                    "HTTP_TARGET_ERROR",
+                                    &format_error_chain(&err),
+                                )
+                                .await;
+                            }
                         }
-                        Err(err) => {
-                            let _ = send_error(
-                                &outbound,
-                                Some(stream_id),
-                                "HTTP_TARGET_ERROR",
-                                &format_error_chain(&err),
-                            )
-                            .await;
-                        }
+                    };
+                    tokio::select! {
+                        biased;
+                        _ = lease.cancelled() => {},
+                        _ = cancellation.cancelled() => {}
+                        _ = work => {}
                     }
-                };
-                tokio::select! {
-                    biased;
-                    _ = lease.cancelled() => {},
-                    _ = cancellation.cancelled() => {}
-                    _ = work => {}
+                    http_bodies.remove(&stream_id);
+                    stream_cancels
+                        .remove_if(&stream_id, |_, current| Arc::ptr_eq(current, &cancellation));
                 }
-                http_bodies.remove(&stream_id);
-                stream_cancels
-                    .remove_if(&stream_id, |_, current| Arc::ptr_eq(current, &cancellation));
-            });
+                .in_current_span(),
+            );
         }
         Message::HttpRequestEnd { stream_id } => {
             http_bodies.remove(&stream_id);
@@ -824,7 +896,9 @@ async fn handle_text_message(
             send_text(outbound, &Message::Pong).await?;
         }
         Message::Pong => {}
-        Message::RegisterAccessV3 { .. }
+        Message::RegisterAccessV4 { .. }
+        | Message::RegisterOkV4 { .. }
+        | Message::RegisterAccessV3 { .. }
         | Message::RegisterOkV3 { .. }
         | Message::RegisterAccess { .. }
         | Message::RegisterOk { .. }
@@ -852,6 +926,10 @@ pub(crate) async fn send_error(
     code: &str,
     message: &str,
 ) -> Result<()> {
+    // Permission rejection is already logged with the full user identity at the authorization boundary.
+    if code != "FORBIDDEN" {
+        warn!(stream_id, code, "{}", message);
+    }
     send_text(
         outbound,
         &Message::Error {

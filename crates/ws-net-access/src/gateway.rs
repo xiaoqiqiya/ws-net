@@ -21,7 +21,8 @@ use ws_net_common::{
     credential_id, decode_data_frame_owned, decode_message, encode_message, random_id,
     try_merge_data_frames, AccessConfig, GatewayError, Message, StreamId, TunnelCipher,
     TunnelFrameKind, CLIENT_NONCE_HEADER, CREDENTIAL_HEADER, DATA_FRAME_HEADER_LEN,
-    MAX_ENCRYPTED_TUNNEL_FRAME_SIZE, PROTOCOL_HEADER, SERVER_NONCE_HEADER,
+    GATEWAY_CREDENTIAL_HEADER, MAX_ENCRYPTED_TUNNEL_FRAME_SIZE, PROTOCOL_HEADER,
+    SERVER_NONCE_HEADER, USER_AUTH_HEADER,
 };
 
 use crate::app::{
@@ -47,7 +48,13 @@ pub(crate) async fn connect_all_registered(
     let gateways = config.gateway_configs()?;
     let identities = gateways
         .iter()
-        .map(|gateway| runtime.identity(&gateway.server_url, &gateway.token))
+        .map(|gateway| {
+            runtime.identity(
+                &gateway.server_url,
+                &gateway.token,
+                gateway.user_token.as_deref(),
+            )
+        })
         .collect::<Result<Vec<_>>>()?;
     for (gateway, identity) in gateways.into_iter().zip(identities) {
         let connections = (0..pool_size)
@@ -55,6 +62,7 @@ pub(crate) async fn connect_all_registered(
                 start_gateway_connection(
                     gateway.server_url.clone(),
                     gateway.token.clone(),
+                    gateway.user_token.clone(),
                     identity.clone(),
                     runtime.instance_id.clone(),
                 )
@@ -73,6 +81,7 @@ pub(crate) async fn connect_all_registered(
 fn start_gateway_connection(
     server_url: String,
     token: String,
+    user_token: Option<String>,
     identity: Arc<AccessIdentity>,
     instance_id: String,
 ) -> Arc<GatewayConnection> {
@@ -107,6 +116,7 @@ fn start_gateway_connection(
     tokio::spawn(run_gateway_connection(
         connection.clone(),
         token,
+        user_token,
         instance_id,
         outbound_rx,
     ));
@@ -117,6 +127,7 @@ fn start_gateway_connection(
 async fn run_gateway_connection(
     connection: Arc<GatewayConnection>,
     token: String,
+    user_token: Option<String>,
     instance_id: String,
     mut outbound_rx: mpsc::Receiver<WsMessage>,
 ) {
@@ -127,7 +138,7 @@ async fn run_gateway_connection(
             biased;
             error = connection.identity.cancelled() => Err(error.into()),
             _ = gateway_stopped(&connection) => Ok(()),
-            result = run_gateway_session(&connection, &token, &instance_id, &mut outbound_rx) => result,
+            result = run_gateway_session(&connection, &token, user_token.as_deref(), &instance_id, &mut outbound_rx) => result,
         };
         if let Err(error) = &result {
             if let Some(error) = error
@@ -197,6 +208,7 @@ fn stop_identity(connection: &GatewayConnection, error: GatewayError) {
 async fn run_gateway_session(
     connection: &Arc<GatewayConnection>,
     token: &str,
+    user_token: Option<&str>,
     instance_id: &str,
     outbound_rx: &mut mpsc::Receiver<WsMessage>,
 ) -> Result<()> {
@@ -209,10 +221,17 @@ async fn run_gateway_session(
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     let mut request = server_url.as_str().into_client_request()?;
     let client_nonce = random_id()?;
-    request.headers_mut().insert(PROTOCOL_HEADER, "3".parse()?);
+    request.headers_mut().insert(
+        PROTOCOL_HEADER,
+        if user_token.is_some() { "4" } else { "3" }.parse()?,
+    );
+    request.headers_mut().insert(
+        CREDENTIAL_HEADER,
+        credential_id(user_token.unwrap_or(token)).parse()?,
+    );
     request
         .headers_mut()
-        .insert(CREDENTIAL_HEADER, credential_id(token).parse()?);
+        .insert(GATEWAY_CREDENTIAL_HEADER, credential_id(token).parse()?);
     request
         .headers_mut()
         .insert(CLIENT_NONCE_HEADER, client_nonce.parse()?);
@@ -227,7 +246,22 @@ async fn run_gateway_session(
         Err(tokio_tungstenite::tungstenite::Error::Http(response))
             if response.status().as_u16() == 401 =>
         {
-            return Err(GatewayError::unauthorized().into())
+            let error = response
+                .body()
+                .as_ref()
+                .and_then(|body| serde_json::from_slice::<GatewayError>(body).ok())
+                .filter(|error| error.code == "UNAUTHORIZED")
+                .unwrap_or_else(GatewayError::unauthorized);
+            return Err(error.into());
+        }
+        Err(tokio_tungstenite::tungstenite::Error::Http(response))
+            if user_token.is_some() && response.status().as_u16() == 400 =>
+        {
+            return Err(GatewayError::new(
+                "UNAUTHORIZED",
+                "网关不支持双 Token 鉴权，请升级 gateway；已停止自动重连。",
+            )
+            .into());
         }
         Err(error) => return Err(error.into()),
     };
@@ -237,8 +271,46 @@ async fn run_gateway_session(
         .get(SERVER_NONCE_HEADER)
         .and_then(|value| value.to_str().ok());
     let v3 = server_nonce.is_some();
+    let v4 = response
+        .headers()
+        .get(PROTOCOL_HEADER)
+        .is_some_and(|value| value == "4");
+    if user_token.is_some() && !v4 {
+        return Err(GatewayError::new(
+            "UNAUTHORIZED",
+            "网关未确认双 Token 鉴权，拒绝降级连接；已停止自动重连。",
+        )
+        .into());
+    }
+    let user_auth = if v4 {
+        match response
+            .headers()
+            .get(USER_AUTH_HEADER)
+            .and_then(|value| value.to_str().ok())
+        {
+            Some("true") => true,
+            Some("false") => false,
+            _ => {
+                return Err(GatewayError::new(
+                    "UNAUTHORIZED",
+                    "网关未确认用户鉴权状态，已停止自动重连。",
+                )
+                .into())
+            }
+        }
+    } else {
+        false
+    };
+    if user_auth && user_token.is_none() {
+        return Err(GatewayError::unauthorized().into());
+    }
     let bootstrap_cipher = if let Some(server_nonce) = server_nonce {
-        TunnelCipher::from_connection_key(token, &client_nonce, server_nonce)?
+        TunnelCipher::from_tokens(
+            token,
+            if user_auth { user_token } else { None },
+            &client_nonce,
+            server_nonce,
+        )?
     } else {
         TunnelCipher::from_shared_key(token)?
     };
@@ -247,7 +319,12 @@ async fn run_gateway_session(
     ws_sender
         .send(encrypt_access_message(
             &bootstrap_cipher,
-            WsMessage::Text(encode_message(&if v3 {
+            WsMessage::Text(encode_message(&if v4 {
+                Message::RegisterAccessV4 {
+                    instance_id: instance_id.to_string(),
+                    client_public_key: ephemeral_key_pair.public_key().to_vec(),
+                }
+            } else if v3 {
                 Message::RegisterAccessV3 {
                     instance_id: instance_id.to_string(),
                     client_public_key: ephemeral_key_pair.public_key().to_vec(),
@@ -265,14 +342,16 @@ async fn run_gateway_session(
         return Err(GatewayError::network("网关在鉴权完成前关闭连接").into());
     };
 
-    let (gateway_public_key, user_name) = match decode_gateway_message(&bootstrap_cipher, frame?)? {
-        Message::RegisterOkV3 {
+    let gateway_public_key = match decode_gateway_message(&bootstrap_cipher, frame?)? {
+        Message::RegisterOkV4 {
             gateway_public_key,
-            user_name,
-        } if v3 => (gateway_public_key, user_name),
-        Message::RegisterOk { gateway_public_key } if !v3 => {
-            (gateway_public_key, "共享 Token".into())
-        }
+            user_auth: confirmed,
+            ..
+        } if v4 && confirmed == user_auth => gateway_public_key,
+        Message::RegisterOkV3 {
+            gateway_public_key, ..
+        } if v3 && !v4 => gateway_public_key,
+        Message::RegisterOk { gateway_public_key } if !v3 => gateway_public_key,
         Message::Error { code, message, .. } => {
             return Err(GatewayError::new(&code, message).into())
         }
@@ -298,7 +377,7 @@ async fn run_gateway_session(
             .store(false, Ordering::Release);
     }
     connection.connected.notify_waiters();
-    info!(server_url = %server_url, user = %user_name, "网关连接成功，鉴权通过");
+    info!(server_url = %server_url, "网关连接成功，鉴权通过");
 
     let mut heartbeat = interval(GATEWAY_PING_INTERVAL);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -612,6 +691,9 @@ async fn handle_gateway_message(connection: &GatewayConnection, message: Message
             message,
         } => {
             let error = GatewayError::new(&code, message);
+            if error.code == "FORBIDDEN" {
+                warn!(server_url = %connection.server_url, stream_id, "{}", error.message);
+            }
             if stream_id.is_none() {
                 if error.terminal() {
                     stop_identity(connection, error.clone());
@@ -637,7 +719,9 @@ async fn handle_gateway_message(connection: &GatewayConnection, message: Message
             send_text(connection, &Message::Pong).await?;
         }
         Message::Pong => {}
-        Message::RegisterAccessV3 { .. }
+        Message::RegisterAccessV4 { .. }
+        | Message::RegisterOkV4 { .. }
+        | Message::RegisterAccessV3 { .. }
         | Message::RegisterOkV3 { .. }
         | Message::RegisterAccess { .. }
         | Message::RegisterOk { .. }
@@ -867,17 +951,28 @@ mod tests {
         use crate::app::AccessRuntime;
         use ws_net_common::GatewayError;
         let runtime = AccessRuntime::new().unwrap();
-        let a = runtime.identity("ws://a.example/tunnel", "same").unwrap();
-        let b = runtime.identity("ws://b.example/tunnel", "same").unwrap();
+        let a = runtime
+            .identity("ws://a.example/tunnel", "gateway-a", Some("same-user"))
+            .unwrap();
+        let b = runtime
+            .identity("ws://b.example/tunnel", "gateway-b", Some("same-user"))
+            .unwrap();
         *a.blocked.lock().unwrap() = Some(GatewayError::replaced());
         a.changed.notify_waiters();
         assert_eq!(a.cancelled().await.code, "SESSION_REPLACED");
-        let reloaded = runtime.identity("ws://a.example/tunnel", "same").unwrap();
+        let reloaded = runtime
+            .identity("ws://a.example/tunnel", "gateway-a", Some("same-user"))
+            .unwrap();
         assert!(std::sync::Arc::ptr_eq(&a, &reloaded));
         assert!(reloaded.error().is_some());
         assert!(b.error().is_none());
         assert!(runtime
-            .identity("ws://a.example/tunnel", "new")
+            .identity("ws://a.example/tunnel", "gateway-a", Some("new-user"))
+            .unwrap()
+            .error()
+            .is_none());
+        assert!(runtime
+            .identity("ws://a.example/tunnel", "new-gateway", Some("same-user"))
             .unwrap()
             .error()
             .is_none());
@@ -928,6 +1023,7 @@ mod tests {
                 name: name.into(),
                 server_url,
                 token: "user".into(),
+                user_token: None,
             })
             .collect(),
             listeners: vec![],

@@ -26,12 +26,15 @@ struct Credential {
 
 impl Credential {
     fn forbidden(&self, target: &TargetConfig) -> GatewayError {
+        tracing::warn!(
+            "访问被拒绝：用户{}无权访问 {}:{}",
+            self.name,
+            target.host,
+            target.port
+        );
         GatewayError::new(
             "FORBIDDEN",
-            format!(
-                "访问被拒绝：用户“{}”无权访问 {}:{}。",
-                self.name, target.host, target.port
-            ),
+            format!("无权访问 {}:{}", target.host, target.port),
         )
     }
 }
@@ -55,6 +58,7 @@ struct SessionInfo {
 
 pub(crate) struct SessionLease {
     id: String,
+    pub(crate) user_name: Option<String>,
     credential: String,
     inner: Weak<Mutex<Runtime>>,
     signal: watch::Sender<Option<GatewayError>>,
@@ -105,15 +109,6 @@ impl SessionLease {
 fn credentials(config: &GatewayConfig) -> Result<HashMap<String, Credential>> {
     config.validate()?;
     let mut credentials = HashMap::new();
-    credentials.insert(
-        credential_id(&config.auth.access_token),
-        Credential {
-            token: config.auth.access_token.clone(),
-            name: "共享 Token".into(),
-            single: false,
-            rules: vec![AccessRule::Any],
-        },
-    );
     if config.auth.enabled {
         for user in &config.users {
             if credentials
@@ -131,6 +126,16 @@ fn credentials(config: &GatewayConfig) -> Result<HashMap<String, Credential>> {
                 return Err(anyhow!("凭证选择标识冲突"));
             }
         }
+    } else {
+        credentials.insert(
+            credential_id(&config.auth.access_token),
+            Credential {
+                token: config.auth.access_token.clone(),
+                name: "共享 Token".into(),
+                single: false,
+                rules: vec![AccessRule::Any],
+            },
+        );
     }
     Ok(credentials)
 }
@@ -158,28 +163,49 @@ impl AppState {
             .clone()
     }
 
-    pub(crate) fn token(&self, id: &str) -> Result<String> {
-        self.inner
-            .lock()
-            .expect("runtime lock poisoned")
-            .credentials
-            .get(id)
-            .map(|credential| credential.token.clone())
-            .ok_or_else(|| GatewayError::unauthorized().into())
+    pub(crate) fn bootstrap_tokens(
+        &self,
+        gateway_id: &str,
+        user_id: Option<&str>,
+    ) -> Result<(String, Option<String>)> {
+        let runtime = self.inner.lock().expect("runtime lock poisoned");
+        if credential_id(&runtime.config.auth.access_token) != gateway_id {
+            return Err(GatewayError::new(
+                "UNAUTHORIZED",
+                "网关鉴权失败：gateway Token 无效或已撤销，已停止自动重连。",
+            )
+            .into());
+        }
+        let user_token = if runtime.config.auth.enabled {
+            Some(runtime.credentials.get(user_id.unwrap_or(""))
+                .ok_or_else(|| GatewayError::new("UNAUTHORIZED", "用户鉴权失败：用户体系已开启，必须提供有效的 user_token，已停止自动重连。"))?
+                .token.clone())
+        } else {
+            None
+        };
+        Ok((runtime.config.auth.access_token.clone(), user_token))
     }
 
     pub(crate) fn register(
         &self,
-        token: &str,
+        gateway_token: &str,
+        user_token: Option<&str>,
         instance: &str,
         legacy: bool,
     ) -> Result<(Arc<SessionLease>, String)> {
-        let id = credential_id(token);
         let session_id = random_id()?;
         let mut runtime = self.inner.lock().expect("runtime lock poisoned");
-        if legacy && token != runtime.config.auth.access_token {
+        if gateway_token != runtime.config.auth.access_token
+            || (legacy && runtime.config.auth.enabled)
+        {
             return Err(GatewayError::unauthorized().into());
         }
+        let token = if runtime.config.auth.enabled {
+            user_token.ok_or_else(GatewayError::unauthorized)?
+        } else {
+            gateway_token
+        };
+        let id = credential_id(token);
         let credential = runtime
             .credentials
             .get(&id)
@@ -230,6 +256,7 @@ impl AppState {
         Ok((
             Arc::new(SessionLease {
                 id: session_id,
+                user_name: runtime.config.auth.enabled.then(|| credential.name.clone()),
                 credential: id,
                 inner: Arc::downgrade(&self.inner),
                 signal,
@@ -246,9 +273,16 @@ impl AppState {
                 "listen 或 path 已修改，需要重启 gateway；本次重载未生效"
             ));
         }
+        let gateway_changed = runtime.config.auth.access_token != config.auth.access_token;
+        if gateway_changed {
+            // Both credentials have changed identity: old gateway-Token histories cannot block a new pair.
+            runtime.orders.clear();
+            runtime.retired.clear();
+        }
         let mut winners = HashMap::<String, (u64, String)>::new();
         for session in runtime.sessions.values() {
-            if session.signal.borrow().is_none()
+            if !gateway_changed
+                && session.signal.borrow().is_none()
                 && next
                     .get(&session.credential)
                     .is_some_and(|credential| credential.single)
@@ -271,28 +305,32 @@ impl AppState {
             runtime.retired.extend(previous);
         }
         for session in runtime.sessions.values() {
-            let error = match (
-                runtime.credentials.get(&session.credential),
-                next.get(&session.credential),
-            ) {
-                (_, None) => Some(GatewayError::changed()),
-                (Some(old), Some(new))
-                    if old.name != new.name
-                        || !old
-                            .rules
-                            .iter()
-                            .all(|rule| new.rules.iter().any(|new| new.covers(rule))) =>
-                {
-                    Some(GatewayError::changed())
+            let error = if gateway_changed {
+                Some(GatewayError::changed())
+            } else {
+                match (
+                    runtime.credentials.get(&session.credential),
+                    next.get(&session.credential),
+                ) {
+                    (_, None) => Some(GatewayError::changed()),
+                    (Some(old), Some(new))
+                        if old.name != new.name
+                            || !old
+                                .rules
+                                .iter()
+                                .all(|rule| new.rules.iter().any(|new| new.covers(rule))) =>
+                    {
+                        Some(GatewayError::changed())
+                    }
+                    (_, Some(_))
+                        if winners
+                            .get(&session.credential)
+                            .is_some_and(|(_, winner)| winner != &session.instance) =>
+                    {
+                        Some(GatewayError::replaced())
+                    }
+                    _ => None,
                 }
-                (_, Some(_))
-                    if winners
-                        .get(&session.credential)
-                        .is_some_and(|(_, winner)| winner != &session.instance) =>
-                {
-                    Some(GatewayError::replaced())
-                }
-                _ => None,
             };
             if session.signal.borrow().is_none() {
                 if let Some(error) = error {
@@ -388,16 +426,16 @@ mod tests {
         let state = AppState::new(config(false)).unwrap();
         let a = random_id().unwrap();
         let b = random_id().unwrap();
-        let (first, _) = state.register("user", &a, false).unwrap();
-        let (second, _) = state.register("user", &b, false).unwrap();
-        let (same_pool, _) = state.register("user", &a, false).unwrap();
+        let (first, _) = state.register("shared", Some("user"), &a, false).unwrap();
+        let (second, _) = state.register("shared", Some("user"), &b, false).unwrap();
+        let (same_pool, _) = state.register("shared", Some("user"), &a, false).unwrap();
         state.reload(config(true)).unwrap();
         assert!(first.check().is_err());
         assert!(same_pool.check().is_err());
         second.check().unwrap();
         assert_eq!(
             state
-                .register("user", &a, false)
+                .register("shared", Some("user"), &a, false)
                 .err()
                 .unwrap()
                 .downcast_ref::<GatewayError>()
@@ -411,9 +449,9 @@ mod tests {
         state.reload(config(true)).unwrap();
         second.check().unwrap();
         let c = random_id().unwrap();
-        assert!(state.register("wrong", &c, false).is_err());
+        assert!(state.register("shared", Some("wrong"), &c, false).is_err());
         second.check().unwrap();
-        let (third, _) = state.register("user", &c, false).unwrap();
+        let (third, _) = state.register("shared", Some("user"), &c, false).unwrap();
         assert!(second.check().is_err());
         third.check().unwrap();
         let mut narrowed = config(true);
@@ -425,7 +463,7 @@ mod tests {
         assert!(state.reload(invalid).is_err());
         assert_eq!(state.config().users[0].allow.len(), 0);
         let other = AppState::new(config(true)).unwrap();
-        other.register("user", &a, false).unwrap();
+        other.register("shared", Some("user"), &a, false).unwrap();
     }
 
     #[tokio::test]
@@ -434,8 +472,9 @@ mod tests {
         config.users[0].allow.clear();
         let state = AppState::new(config).unwrap();
         let (lease, _) = state
-            .register("user", &random_id().unwrap(), false)
+            .register("shared", Some("user"), &random_id().unwrap(), false)
             .unwrap();
+        assert_eq!(lease.user_name.as_deref(), Some("李四"));
         let target = TargetConfig {
             mode: ws_net_common::Mode::Tcp,
             host: "must-not-resolve.invalid".into(),
@@ -451,61 +490,76 @@ mod tests {
         let error = error.downcast_ref::<GatewayError>().unwrap();
         assert_eq!(error.code, "FORBIDDEN");
         assert_eq!(error.http_status(), 403);
-        assert!(error.message.contains("李四"));
-        assert!(error.message.contains("must-not-resolve.invalid:22"));
+        assert_eq!(error.message, "无权访问 must-not-resolve.invalid:22");
+        assert!(!error.terminal());
         lease.check().unwrap();
     }
 
     #[tokio::test]
-    async fn shared_rotation_preserves_users_and_explicit_single_override() {
+    async fn both_tokens_and_gateway_rotation_enforce_user_identity() {
         let mut config = config(false);
         config.users[0].single_access = Some(true);
         let state = AppState::new(config.clone()).unwrap();
         let a = random_id().unwrap();
         let b = random_id().unwrap();
-        let (first, _) = state.register("user", &a, false).unwrap();
-        let (shared_a, _) = state.register("shared", &a, true).unwrap();
-        let (shared_b, _) = state.register("shared", &b, true).unwrap();
-        let (second, _) = state.register("user", &b, false).unwrap();
+        let (first, _) = state.register("shared", Some("user"), &a, false).unwrap();
+        let (second, _) = state.register("shared", Some("user"), &b, false).unwrap();
         assert_eq!(first.cancelled().await.code, "SESSION_REPLACED");
-        shared_a.check().unwrap();
-        shared_b.check().unwrap();
+        for (gateway, user) in [
+            ("shared", None),
+            ("wrong", Some("user")),
+            ("shared", Some("wrong")),
+        ] {
+            assert!(state.register(gateway, user, &a, false).is_err());
+            second.check().unwrap();
+        }
+        assert!(state
+            .bootstrap_tokens(&credential_id("wrong"), Some(&credential_id("user")))
+            .is_err());
+        assert!(state
+            .bootstrap_tokens(&credential_id("shared"), None)
+            .is_err());
 
         config.auth.access_token = "replacement-shared".into();
         state.reload(config).unwrap();
-        assert_eq!(shared_a.cancelled().await.code, "AUTH_CHANGED");
-        assert_eq!(shared_b.cancelled().await.code, "AUTH_CHANGED");
-        second.check().unwrap();
-        let error = state.register("shared", &a, true).err().unwrap();
+        assert_eq!(second.cancelled().await.code, "AUTH_CHANGED");
+        let error = state
+            .register("shared", Some("user"), &b, false)
+            .err()
+            .unwrap();
         assert_eq!(
             error.downcast_ref::<GatewayError>().unwrap().code,
             "UNAUTHORIZED"
         );
-        let (replacement_a, _) = state.register("replacement-shared", &a, true).unwrap();
-        let (replacement_b, _) = state.register("replacement-shared", &b, true).unwrap();
-        replacement_a.check().unwrap();
-        replacement_b.check().unwrap();
-        second.check().unwrap();
+        let (replacement, _) = state
+            .register("replacement-shared", Some("user"), &a, false)
+            .unwrap();
+        replacement.check().unwrap();
     }
 
     #[tokio::test]
     async fn shared_disabled_users_and_exact_target_rules() {
-        let state = AppState::new(config(true)).unwrap();
+        let mut disabled = config(true);
+        disabled.auth.enabled = false;
+        let state = AppState::new(disabled).unwrap();
         let (shared_a, _) = state
-            .register("shared", &random_id().unwrap(), true)
+            .register("shared", None, &random_id().unwrap(), true)
             .unwrap();
         let (shared_b, _) = state
-            .register("shared", &random_id().unwrap(), true)
+            .register("shared", None, &random_id().unwrap(), true)
             .unwrap();
         shared_a.check().unwrap();
         shared_b.check().unwrap();
-        let mut disabled = config(true);
-        disabled.auth.enabled = false;
-        state.reload(disabled).unwrap();
+        assert!(shared_a.user_name.is_none());
+        assert!(shared_b.user_name.is_none());
         assert!(state
-            .register("user", &random_id().unwrap(), false)
-            .is_err());
-        shared_a.check().unwrap();
+            .bootstrap_tokens(
+                &credential_id("shared"),
+                Some(&credential_id("unused-user"))
+            )
+            .unwrap()
+            .1
+            .is_none());
         let target = TargetConfig {
             mode: ws_net_common::Mode::Tcp,
             host: "127.0.0.1".into(),
@@ -519,5 +573,17 @@ mod tests {
             state.authorize_target(&shared_a, &target).await.unwrap()[0].port(),
             22
         );
+        state.reload(config(true)).unwrap();
+        assert_eq!(shared_a.cancelled().await.code, "AUTH_CHANGED");
+        assert_eq!(shared_b.cancelled().await.code, "AUTH_CHANGED");
+        assert!(state
+            .register("shared", None, &random_id().unwrap(), false)
+            .is_err());
+        assert!(state
+            .register("shared", Some("user"), &random_id().unwrap(), true)
+            .is_err());
+        state
+            .register("shared", Some("user"), &random_id().unwrap(), false)
+            .unwrap();
     }
 }

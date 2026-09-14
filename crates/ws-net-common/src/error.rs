@@ -19,7 +19,7 @@ impl GatewayError {
     pub fn unauthorized() -> Self {
         Self::new(
             "UNAUTHORIZED",
-            "鉴权失败：Token 无效或已被撤销，已停止自动重连。",
+            "鉴权失败：gateway Token 无效，或用户体系开启时 user_token 未配置、无效或已被撤销，已停止自动重连。",
         )
     }
 

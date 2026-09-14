@@ -139,7 +139,7 @@ async fn handle_tcp_stream_result(
         loop {
             tokio::select! {
                 _ = cancellation.cancelled() => {
-                    info!(stream_id, target = %target_name, "tcp stream canceled by access close");
+                    info!(stream_id, target = %target_name, "客户端已取消 TCP 连接");
                     break;
                 }
                 read = read_data_frame(&mut tcp_read, stream_id), if !target_read_closed => {
@@ -163,13 +163,13 @@ async fn handle_tcp_stream_result(
                             stream_id,
                             target = %target_name,
                             wait_ms = send_elapsed.as_millis(),
-                            "slow target-to-websocket channel send"
+                            "目标数据发送到隧道耗时较长"
                         );
                     }
                 }
                 bytes = write_rx.recv(), if !access_closed => {
                     let Some(bytes) = bytes else {
-                        info!(stream_id, target = %target_name, "tcp stream access side closed");
+                        info!(stream_id, target = %target_name, "TCP 客户端发送方向已关闭");
                         access_closed = true;
                         tcp_write.shutdown().await?;
                         if target_read_closed {
@@ -188,7 +188,7 @@ async fn handle_tcp_stream_result(
                             stream_id,
                             target = %target_name,
                             write_ms = write_elapsed.as_millis(),
-                            "slow websocket-to-target tcp write"
+                            "隧道数据写入目标 TCP 耗时较长"
                         );
                     }
                 }
@@ -211,7 +211,7 @@ async fn handle_tcp_stream_result(
         max_outbound_wait_ms,
         max_target_write_ms,
         ok = result.is_ok(),
-        "tcp target session ended"
+        "目标 TCP 会话结束"
     );
 
     result
