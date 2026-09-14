@@ -8,7 +8,7 @@ server_url = "ws://127.0.0.1:8443/tunnel"
 token = "change-primary-access-token"
 # token 对应 gateway 的 auth.access_token。
 # gateway 的 auth.enabled = true 时，还必须填写用户 Token；false 时可省略。
-# user_token = "gateway adduser 返回的用户token"
+# user_token = "ws-net-gateway adduser 返回的用户token"
 
 [[gateways]]
 name = "secondary"

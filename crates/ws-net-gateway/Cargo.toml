@@ -7,10 +7,6 @@ edition.workspace = true
 name = "ws-net-gateway"
 path = "src/main.rs"
 
-[[bin]]
-name = "gateway"
-path = "src/alias.rs"
-
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true

@@ -9,10 +9,10 @@ enabled = false
 # 用户未显式设置 single_access 时继承这里的值。
 single_access = true
 
-# 开启用户体系后可执行 gateway adduser 李四，生成 Token 并自动加载。
-# 新用户默认 allow = []，修改权限后执行 gateway reload。
+# 开启用户体系后可执行 ws-net-gateway adduser 李四，生成 Token 并自动加载。
+# 新用户默认 allow = []，修改权限后执行 ws-net-gateway reload。
 # [[users]]
 # name = "李四"
-# token = "由 gateway adduser 生成"
+# token = "由 ws-net-gateway adduser 生成"
 # allow = ["192.168.1.20:*", "192.168.1.10:22"]
 # single_access = false # 可选，显式覆盖全局设置

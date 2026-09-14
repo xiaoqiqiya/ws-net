@@ -64,7 +64,7 @@ async fn run() -> Result<()> {
                         println!("用户“{username}”已保存，配置已加载。用户体系当前已关闭，启用后该 Token 才能使用。");
                     }
                     println!("Token：{token}");
-                    println!("默认未授权任何资源，请修改 allow 后执行 gateway reload。");
+                    println!("默认未授权任何资源，请修改 allow 后执行 ws-net-gateway reload。");
                 }
                 Ok(None) => {
                     println!("用户“{username}”已保存。\nToken：{token}\ngateway 未运行，下次启动时生效。");
@@ -73,11 +73,11 @@ async fn run() -> Result<()> {
                     let (reason, state_message) = match result {
                         Ok(Some(response)) => (
                             response.error.unwrap_or_else(|| "配置加载失败".into()),
-                            "运行进程继续使用原配置，请修正问题后执行 gateway reload。",
+                            "运行进程继续使用原配置，请修正问题后执行 ws-net-gateway reload。",
                         ),
                         Err(error) => (
                             error.to_string(),
-                            "未能确认运行进程是否已加载配置，请检查状态后执行 gateway reload。",
+                            "未能确认运行进程是否已加载配置，请检查状态后执行 ws-net-gateway reload。",
                         ),
                         _ => unreachable!(),
                     };

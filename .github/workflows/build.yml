@@ -76,7 +76,6 @@ jobs:
         run: |
           mkdir -p dist
           cp target/${{ matrix.target }}/release/ws-net-gateway dist/
-          cp target/${{ matrix.target }}/release/gateway dist/
           cp target/${{ matrix.target }}/release/ws-net-access dist/
           cp gateway.example.toml dist/
           cp access.example.toml dist/
@@ -87,7 +86,6 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target/release/ws-net-gateway.exe dist/
-          Copy-Item target/release/gateway.exe dist/
           Copy-Item target/release/ws-net-access.exe dist/
           Copy-Item gateway.example.toml dist/
           Copy-Item access.example.toml dist/
