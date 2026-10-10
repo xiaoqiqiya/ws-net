@@ -7,7 +7,7 @@ use std::{collections::HashMap, io};
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use dashmap::DashMap;
-use tokio::sync::{mpsc, oneshot, Notify, RwLock};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use ws_net_common::{
     access_credential_id, random_id, AccessConfig, DataFramePayload, GatewayError,
@@ -16,9 +16,8 @@ use ws_net_common::{
 
 #[derive(Clone)]
 pub(crate) struct AppState {
-    pub(crate) config: Arc<RwLock<AccessConfig>>,
-    pub(crate) default_server_url: Arc<RwLock<Option<String>>>,
-    pub(crate) connections: Arc<RwLock<Arc<GatewayConnections>>>,
+    pub(crate) default_server_url: Option<String>,
+    pub(crate) connections: Arc<GatewayConnections>,
     pub(crate) runtime: Arc<AccessRuntime>,
 }
 
@@ -265,19 +264,4 @@ pub(crate) fn default_server_url(config: &AccessConfig) -> Option<String> {
             _ => None,
         }
     })
-}
-
-pub(crate) async fn current_listener(
-    state: &AppState,
-    fallback: &ListenerConfig,
-) -> ListenerConfig {
-    state
-        .config
-        .read()
-        .await
-        .listeners
-        .iter()
-        .find(|listener| listener.name == fallback.name)
-        .cloned()
-        .unwrap_or_else(|| fallback.clone())
 }

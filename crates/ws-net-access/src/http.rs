@@ -1,4 +1,4 @@
-use std::{collections::HashSet, net::SocketAddr, sync::Arc};
+use std::{collections::HashSet, sync::Arc};
 
 use anyhow::{anyhow, Result};
 use axum::{
@@ -20,14 +20,15 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
+    task::JoinSet,
 };
 use tokio_rustls::TlsAcceptor;
 use tracing::{error, info, warn};
 use ws_net_common::{encode_data_frame, GatewayError, HttpRequestHead, ListenerConfig, Message};
 
 use crate::{
-    app::{current_listener, AppState},
+    app::AppState,
     gateway::{
         ensure_gateway_ready, gateway_closed, is_gateway_disconnected_error, next_stream_id,
         send_binary, send_text,
@@ -40,8 +41,13 @@ struct HttpListenerState {
     listener: ListenerConfig,
 }
 
-pub(crate) async fn run_http_listener(state: AppState, listener: ListenerConfig) -> Result<()> {
-    let addr: SocketAddr = listener.listen.parse()?;
+pub(crate) async fn run_http_listener(
+    state: AppState,
+    listener: ListenerConfig,
+    tcp_listener: TcpListener,
+    tls_acceptor: Option<TlsAcceptor>,
+    mut shutdown: watch::Receiver<()>,
+) -> Result<()> {
     let http_state = HttpListenerState {
         app: state,
         listener: listener.clone(),
@@ -49,60 +55,72 @@ pub(crate) async fn run_http_listener(state: AppState, listener: ListenerConfig)
     let app = Router::new()
         .fallback(any(handle_http_request))
         .with_state(http_state);
-    let tcp_listener = TcpListener::bind(addr).await?;
-
-    if listener.local_scheme.as_deref() == Some("https") {
-        if !listener.auto_cert {
-            return Err(anyhow!(
-                "监听器“{}”使用 HTTPS，必须开启 auto_cert",
-                listener.name
-            ));
-        }
-
+    if tls_acceptor.is_some() {
         info!(name = %listener.name, listen = %listener.listen, host = %listener.host, target = %listener.host, port = listener.port, "HTTPS 监听器已启动，使用内存自签名证书");
-        serve_https_listener(tcp_listener, app, &listener.host).await?;
     } else {
         info!(name = %listener.name, listen = %listener.listen, target = %listener.host, port = listener.port, "HTTP 监听器已启动");
-        axum::serve(tcp_listener, app).await?;
     }
 
-    Ok(())
-}
-
-async fn serve_https_listener(tcp_listener: TcpListener, app: Router, host: &str) -> Result<()> {
-    let tls_acceptor = TlsAcceptor::from(Arc::new(self_signed_tls_config(host)?));
-    let host = host.to_string();
-
-    loop {
-        let (mut socket, peer) = tcp_listener.accept().await?;
+    let mut sessions = JoinSet::new();
+    let result = loop {
+        let accepted = tokio::select! {
+            biased;
+            _ = shutdown.changed() => break Ok(()),
+            _ = sessions.join_next(), if !sessions.is_empty() => continue,
+            accepted = tcp_listener.accept() => accepted,
+        };
+        let (mut socket, peer) = match accepted {
+            Ok(accepted) => accepted,
+            Err(error) => break Err(error.into()),
+        };
         let tls_acceptor = tls_acceptor.clone();
         let app = app.clone();
-        let host = host.clone();
+        let host = listener.host.clone();
 
-        tokio::spawn(async move {
-            if let Err(err) = reject_plain_http_on_https(&mut socket, &host).await {
-                warn!(peer = %peer, error = %err, "HTTPS 监听器收到不合法连接");
-                return;
-            }
-
-            let tls_stream = match tls_acceptor.accept(socket).await {
-                Ok(stream) => stream,
-                Err(err) => {
-                    warn!(peer = %peer, error = %err, "TLS 握手失败");
+        sessions.spawn(async move {
+            let service = TowerToHyperService::new(app);
+            let result = if let Some(tls_acceptor) = tls_acceptor {
+                if let Err(err) = reject_plain_http_on_https(&mut socket, &host).await {
+                    warn!(peer = %peer, error = %err, "HTTPS 监听器收到不合法连接");
                     return;
                 }
+                let tls_stream = match tls_acceptor.accept(socket).await {
+                    Ok(stream) => stream,
+                    Err(err) => {
+                        warn!(peer = %peer, error = %err, "TLS 握手失败");
+                        return;
+                    }
+                };
+                HyperBuilder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(tls_stream), service)
+                    .await
+            } else {
+                HyperBuilder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(socket), service)
+                    .await
             };
-
-            let service = TowerToHyperService::new(app);
-            let io = TokioIo::new(tls_stream);
-            if let Err(err) = HyperBuilder::new(TokioExecutor::new())
-                .serve_connection(io, service)
-                .await
-            {
-                warn!(peer = %peer, error = %err, "HTTPS 连接处理失败");
+            if let Err(err) = result {
+                warn!(peer = %peer, error = %err, "HTTP 连接处理失败");
             }
         });
+    };
+    sessions.shutdown().await;
+    result
+}
+
+pub(crate) fn listener_tls_acceptor(listener: &ListenerConfig) -> Result<Option<TlsAcceptor>> {
+    if listener.local_scheme.as_deref() != Some("https") {
+        return Ok(None);
     }
+    if !listener.auto_cert {
+        return Err(anyhow!(
+            "监听器“{}”使用 HTTPS，必须开启 auto_cert",
+            listener.name
+        ));
+    }
+    Ok(Some(TlsAcceptor::from(Arc::new(self_signed_tls_config(
+        &listener.host,
+    )?))))
 }
 
 async fn reject_plain_http_on_https(socket: &mut TcpStream, host: &str) -> Result<()> {
@@ -179,10 +197,11 @@ async fn handle_http_request_result(
     state: HttpListenerState,
     request: Request<Body>,
 ) -> Result<Response<Body>> {
-    let listener = current_listener(&state.app, &state.listener).await;
-    let default_server_url = state.app.default_server_url.read().await.clone();
-    let connections = state.app.connections.read().await.clone();
-    let connection = connections.for_listener(&listener, default_server_url.as_deref())?;
+    let listener = &state.listener;
+    let connection = state
+        .app
+        .connections
+        .for_listener(listener, state.app.default_server_url.as_deref())?;
     let stream_id = next_stream_id(&connection);
     ensure_gateway_ready(&connection).await?;
     let (parts, body) = request.into_parts();

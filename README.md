@@ -441,7 +441,7 @@ cargo fmt --all && cargo check --workspace && cargo test --workspace
 
 当前版本已经支持长连接复用、二进制 TCP 数据帧和 HTTP 请求/响应流式转发，但仍有一些限制：
 
-- access 配置热重载会更新 gateway 连接、token 和已有 listener 使用的目标参数；新增/删除 listener，或修改 listener 的 `listen`、`mode` 时仍需重启 access 才会改变本地监听任务。
+- access 每 2 秒检查配置文件变化，保存后自动重载 gateway 连接、Token 和全部 listener；新增、删除、改名以及修改 `listen`、`mode`、`local_scheme`、`auto_cert` 均可生效，无需重启。重载会关闭已有业务连接，客户端需重新连接。配置校验失败时保留原配置；新端口绑定失败时恢复原监听配置并记录错误，若旧端口也被其他进程占用，会明确提示恢复失败。启动日志显示实际配置文件的绝对路径；“配置重新加载成功”表示本地配置已应用，网关连接和鉴权结果请查看后续日志。
 - gateway 和 access 之间的业务帧和认证帧都使用 ChaCha20-Poly1305 内层加密；`ws://` 下仍可防止被动窃听，生产环境仍必须使用 `wss://`。
 - `token` 只用于保护认证握手；每条 WebSocket 连接都会自动通过 X25519 协商临时会话密钥，断开即丢弃。`token` 应是强随机秘密，不要提交到 Git、日志或聊天记录。
 

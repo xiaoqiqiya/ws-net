@@ -4,7 +4,8 @@ use anyhow::{anyhow, Result};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{tcp::OwnedReadHalf, TcpListener, TcpStream},
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
+    task::JoinSet,
     time::{timeout, Instant},
 };
 use tracing::{debug, info, warn};
@@ -14,7 +15,7 @@ use ws_net_common::{
 };
 
 use crate::{
-    app::{current_listener, AppState},
+    app::AppState,
     gateway::{ensure_gateway_ready, gateway_closed, next_stream_id, send_binary, send_text},
 };
 
@@ -23,15 +24,29 @@ const TCP_STREAM_CHANNEL_CAPACITY: usize = 64;
 const STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 const TCP_SLOW_IO: Duration = Duration::from_millis(20);
 
-pub(crate) async fn run_tcp_listener(state: AppState, listener: ListenerConfig) -> Result<()> {
-    let tcp_listener = TcpListener::bind(&listener.listen).await?;
+pub(crate) async fn run_tcp_listener(
+    state: AppState,
+    listener: ListenerConfig,
+    tcp_listener: TcpListener,
+    mut shutdown: watch::Receiver<()>,
+) -> Result<()> {
     info!(name = %listener.name, listen = %listener.listen, target = %listener.host, port = listener.port, "TCP 监听器已启动");
 
-    loop {
-        let (socket, peer) = tcp_listener.accept().await?;
+    let mut sessions = JoinSet::new();
+    let result = loop {
+        let accepted = tokio::select! {
+            biased;
+            _ = shutdown.changed() => break Ok(()),
+            _ = sessions.join_next(), if !sessions.is_empty() => continue,
+            accepted = tcp_listener.accept() => accepted,
+        };
+        let (socket, peer) = match accepted {
+            Ok(accepted) => accepted,
+            Err(error) => break Err(error.into()),
+        };
         let state = state.clone();
         let listener = listener.clone();
-        tokio::spawn(async move {
+        sessions.spawn(async move {
             if let Err(err) = handle_tcp_connection(state, listener, socket).await {
                 match err.downcast_ref::<GatewayError>() {
                     Some(error) if error.code == "UNAUTHORIZED" => {
@@ -42,7 +57,9 @@ pub(crate) async fn run_tcp_listener(state: AppState, listener: ListenerConfig) 
                 }
             }
         });
-    }
+    };
+    sessions.shutdown().await;
+    result
 }
 
 async fn handle_tcp_connection(
@@ -53,10 +70,9 @@ async fn handle_tcp_connection(
     let session_started = Instant::now();
     socket.set_nodelay(true)?;
 
-    let listener = current_listener(&state, &listener).await;
-    let default_server_url = state.default_server_url.read().await.clone();
-    let connections = state.connections.read().await.clone();
-    let connection = connections.for_listener(&listener, default_server_url.as_deref())?;
+    let connection = state
+        .connections
+        .for_listener(&listener, state.default_server_url.as_deref())?;
     let stream_id = next_stream_id(&connection);
 
     info!(

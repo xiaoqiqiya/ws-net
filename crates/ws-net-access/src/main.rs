@@ -1,22 +1,20 @@
-use std::{path::PathBuf, sync::Arc};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tokio::sync::RwLock;
-use tracing::error;
-use ws_net_common::{AccessConfig, Mode};
+use ws_net_common::AccessConfig;
 
 mod app;
 mod config_reload;
 mod gateway;
 mod http;
+mod listeners;
 mod tcp;
 
 use app::{default_server_url, AccessRuntime, AppState};
 use config_reload::watch_access_config;
 use gateway::connect_all_registered;
-use http::run_http_listener;
-use tcp::run_tcp_listener;
+use listeners::{Listeners, PreparedListeners};
 
 #[derive(Debug, Parser)]
 #[command(about = "本地访问客户端")]
@@ -38,8 +36,11 @@ async fn run() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
 
     let args = Args::parse();
-    let config_path = PathBuf::from(&args.config);
+    let config_path = PathBuf::from(&args.config)
+        .canonicalize()
+        .context("无法确定 access 配置文件路径")?;
     let config = AccessConfig::load(&config_path).context("加载 access 配置失败")?;
+    let bound_listeners = PreparedListeners::new(&config.listeners)?.bind().await?;
     let runtime = AccessRuntime::new()?;
     let connections = connect_all_registered(&config, &runtime).await?;
     let default_server_url = default_server_url(&config);
@@ -49,33 +50,14 @@ async fn run() -> Result<()> {
             .with_context(|| format!("监听器“{}”的网关配置校验失败", listener.name))?;
     }
     let state = AppState {
-        config: Arc::new(RwLock::new(config.clone())),
-        default_server_url: Arc::new(RwLock::new(default_server_url)),
-        connections: Arc::new(RwLock::new(connections)),
+        default_server_url,
+        connections,
         runtime,
     };
 
-    tokio::spawn(watch_access_config(config_path, state.clone()));
-
-    for listener in config.listeners.clone() {
-        let state = state.clone();
-        match listener.mode {
-            Mode::Tcp => {
-                tokio::spawn(async move {
-                    if let Err(err) = run_tcp_listener(state, listener).await {
-                        error!(error = %err, "TCP 监听器已停止");
-                    }
-                });
-            }
-            Mode::Http => {
-                tokio::spawn(async move {
-                    if let Err(err) = run_http_listener(state, listener).await {
-                        error!(error = %err, "HTTP 监听器已停止");
-                    }
-                });
-            }
-        }
-    }
+    let listeners = Listeners::start(state.clone(), bound_listeners);
+    tracing::info!(path = %config_path.display(), "客户端配置已加载，开始监测配置变化");
+    tokio::spawn(watch_access_config(config_path, config, state, listeners));
 
     tokio::signal::ctrl_c().await?;
     Ok(())
